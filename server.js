@@ -1,11 +1,16 @@
-const express = require('express');
-const cors = require('cors');
-const multer = require('multer');
-const path = require('path');
-const fs = require('fs');
-const Pusher = require('pusher');
-const { Redis } = require('@upstash/redis');
-const { handleUpload, del } = require('@vercel/blob');
+import express from 'express';
+import cors from 'cors';
+import multer from 'multer';
+import path from 'path';
+import fs from 'fs';
+import Pusher from 'pusher';
+import { Redis } from '@upstash/redis';
+import { del } from '@vercel/blob';
+import { handleUpload } from '@vercel/blob/client';
+import { fileURLToPath } from 'url';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 // Express App Setup
 const app = express();
@@ -894,4 +899,4 @@ if (!process.env.VERCEL) {
   });
 }
 
-module.exports = app;
+export default app;
