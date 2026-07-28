@@ -28,7 +28,16 @@ const isProduction = window.location.hostname !== 'localhost' && window.location
 if (isProduction && !config.isRedisConfigured) {
   setTimeout(() => {
     showToast('Database not connected! Rooms will expire instantly on Vercel. Please connect Upstash Redis in your Vercel Dashboard.', 'error');
-  }, 1000);
+    
+    const banner = document.getElementById('db-alert-banner');
+    if (banner) banner.classList.remove('hidden');
+    
+    // Disable inputs and buttons on landing page
+    const inputs = document.querySelectorAll('#create-form input, #join-form input');
+    const buttons = document.querySelectorAll('#create-form button, #join-form button');
+    inputs.forEach(input => input.disabled = true);
+    buttons.forEach(button => button.disabled = true);
+  }, 500);
 }
 
 // Check if kicked recently (Genius UX check across reload)

@@ -1395,3 +1395,43 @@ input:checked + .slider:before {
     justify-content: center;
   }
 }
+
+/* --- DB Alert Banner --- */
+.db-alert-banner {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  background: rgba(239, 68, 68, 0.1);
+  border: 1px solid rgba(239, 68, 68, 0.2);
+  border-radius: 12px;
+  padding: 16px 20px;
+  margin-bottom: 24px;
+  max-width: 800px;
+  width: 100%;
+  margin-left: auto;
+  margin-right: auto;
+}
+.db-alert-banner.hidden {
+  display: none !important;
+}
+.db-alert-banner .alert-icon {
+  width: 24px;
+  height: 24px;
+  color: var(--danger);
+  flex-shrink: 0;
+}
+.db-alert-banner .alert-text {
+  font-size: 0.9rem;
+  color: var(--text-main);
+  line-height: 1.5;
+}
+.db-alert-banner .alert-text strong {
+  color: var(--danger);
+}
+
+/* Disable styles for landing page forms when database is unlinked */
+input:disabled, button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed !important;
+  pointer-events: none;
+}
