@@ -1,30 +1,31 @@
 const express = require('express');
-const http = require('http');
-const { Server } = require('socket.io');
+const cors = require('cors');
 const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
-const cors = require('cors');
+const Pusher = require('pusher');
+const { Redis } = require('@upstash/redis');
+const { handleUpload, del } = require('@vercel/blob');
 
 // Express App Setup
 const app = express();
 app.use(cors());
 app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 app.use(express.static(path.join(__dirname, 'public')));
 
-// Ensure Uploads Directory exists
-const UPLOADS_DIR = path.join(__dirname, 'uploads');
-if (!fs.existsSync(UPLOADS_DIR)) {
+// Ensure Local Uploads Directory exists (for local fallback)
+const UPLOADS_DIR = path.join(__dirname, 'public', 'uploads');
+if (!process.env.VERCEL && !fs.existsSync(UPLOADS_DIR)) {
   fs.mkdirSync(UPLOADS_DIR, { recursive: true });
 }
 
-// Multer Storage Configuration
+// Multer Storage Configuration (for local fallback)
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
     cb(null, UPLOADS_DIR);
   },
   filename: (req, file, cb) => {
-    // Save file with a unique name
     const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1e9);
     cb(null, uniqueSuffix + path.extname(file.originalname));
   }
@@ -34,87 +35,720 @@ const upload = multer({
   limits: { fileSize: 50 * 1024 * 1024 } // 50MB limit
 });
 
-// HTTP and Socket.io Server Setup
-const server = http.createServer(app);
-const io = new Server(server, {
-  cors: {
-    origin: '*',
-    methods: ['GET', 'POST']
+// --- Mock Redis for Local Development ---
+class MockRedis {
+  constructor() {
+    this.store = new Map();
+    this.ttls = new Map();
   }
-});
 
-// In-Memory Database
-// Key: roomCode (string) -> Value: { code, createdAt, messages: [], files: [], users: Map(socket.id -> nickname) }
-const rooms = new Map();
+  async exists(key) {
+    this._checkExpired(key);
+    return this.store.has(key) ? 1 : 0;
+  }
+
+  async hset(key, fieldOrObj, value) {
+    this._checkExpired(key);
+    if (!this.store.has(key)) this.store.set(key, {});
+    const data = this.store.get(key);
+    if (typeof fieldOrObj === 'object') {
+      Object.assign(data, fieldOrObj);
+    } else {
+      data[fieldOrObj] = value;
+    }
+  }
+
+  async hgetall(key) {
+    this._checkExpired(key);
+    return this.store.get(key) || null;
+  }
+
+  async hget(key, field) {
+    this._checkExpired(key);
+    const data = this.store.get(key);
+    return data ? data[field] : null;
+  }
+
+  async hdel(key, field) {
+    this._checkExpired(key);
+    const data = this.store.get(key);
+    if (data) delete data[field];
+  }
+
+  async del(key) {
+    this.store.delete(key);
+    this.ttls.delete(key);
+  }
+
+  async rpush(key, value) {
+    this._checkExpired(key);
+    if (!this.store.has(key)) this.store.set(key, []);
+    const arr = this.store.get(key);
+    arr.push(value);
+  }
+
+  async lrange(key, start, stop) {
+    this._checkExpired(key);
+    const arr = this.store.get(key) || [];
+    if (stop === -1) return arr.slice(start);
+    return arr.slice(start, stop + 1);
+  }
+
+  async expire(key, seconds) {
+    this.ttls.set(key, Date.now() + seconds * 1000);
+  }
+
+  _checkExpired(key) {
+    if (this.ttls.has(key) && Date.now() > this.ttls.get(key)) {
+      this.store.delete(key);
+      this.store.delete(`${key}:messages`);
+      this.store.delete(`${key}:files`);
+      this.store.delete(`${key}:users`);
+      this.store.delete(`${key}:lobby`);
+      this.ttls.delete(key);
+    }
+  }
+}
+
+// --- Initialize Database & Real-time Clients ---
+const isRedisConfigured = !!(process.env.KV_REST_API_URL || process.env.UPSTASH_REDIS_REST_URL);
+const redis = isRedisConfigured
+  ? new Redis({
+      url: process.env.KV_REST_API_URL || process.env.UPSTASH_REDIS_REST_URL,
+      token: process.env.KV_REST_API_TOKEN || process.env.UPSTASH_REDIS_REST_TOKEN,
+    })
+  : new MockRedis();
+
+if (!isRedisConfigured) {
+  console.log('Using in-memory Mock Redis for local development.');
+}
+
+const isPusherConfigured = !!(process.env.PUSHER_APP_ID && process.env.PUSHER_KEY && process.env.PUSHER_SECRET);
+const pusher = isPusherConfigured
+  ? new Pusher({
+      appId: process.env.PUSHER_APP_ID,
+      key: process.env.PUSHER_KEY,
+      secret: process.env.PUSHER_SECRET,
+      cluster: process.env.PUSHER_CLUSTER,
+      useTLS: true,
+    })
+  : null;
+
+if (!isPusherConfigured) {
+  console.warn('Pusher credentials missing. Real-time functions will fall back to polling.');
+}
+
+// Constant configuration
+const EXPIRATION_TIME = 60 * 60 * 1000; // 1 hour
 
 // Helper to generate room codes
-function generateRoomCode() {
+async function generateRoomCode() {
   const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
   let code = '';
-  do {
+  let exists = true;
+  while (exists) {
     code = '';
     for (let i = 0; i < 6; i++) {
       code += chars.charAt(Math.floor(Math.random() * chars.length));
     }
-  } while (rooms.has(code));
+    exists = await redis.exists(`room:${code}`);
+  }
   return code;
 }
 
-// Clean up expired messages and files (Older than 1 hour = 3,600,000 ms)
-const EXPIRATION_TIME = 60 * 60 * 1000; // 1 hour
-
-function cleanupExpiredData() {
-  const now = Date.now();
-  console.log(`Running cleanup check at ${new Date().toISOString()}...`);
-
-  rooms.forEach((room, roomCode) => {
-    // 1. Clean up expired messages
-    const expiredMessages = room.messages.filter(msg => now - msg.timestamp >= EXPIRATION_TIME);
-    if (expiredMessages.length > 0) {
-      room.messages = room.messages.filter(msg => now - msg.timestamp < EXPIRATION_TIME);
-      // Notify room clients about expired messages
-      expiredMessages.forEach(msg => {
-        io.to(roomCode).emit('message-expired', { id: msg.id });
-      });
-      console.log(`Removed ${expiredMessages.length} expired messages in room ${roomCode}`);
+// Helper to trigger Pusher events
+async function triggerEvent(channel, event, data) {
+  if (pusher) {
+    try {
+      await pusher.trigger(channel, event, data);
+    } catch (err) {
+      console.error(`Pusher trigger error:`, err);
     }
-
-    // 2. Clean up expired files
-    const expiredFiles = room.files.filter(file => now - file.timestamp >= EXPIRATION_TIME);
-    if (expiredFiles.length > 0) {
-      room.files = room.files.filter(file => now - file.timestamp < EXPIRATION_TIME);
-      expiredFiles.forEach(file => {
-        // Delete physical file
-        fs.unlink(file.path, (err) => {
-          if (err) {
-            console.error(`Failed to delete expired file ${file.path}:`, err);
-          } else {
-            console.log(`Deleted physical file: ${file.originalName}`);
-          }
-        });
-        // Notify room clients about expired file
-        io.to(roomCode).emit('file-expired', { id: file.id });
-      });
-      console.log(`Removed ${expiredFiles.length} expired files in room ${roomCode}`);
-    }
-
-    // 3. Clean up empty & old rooms (inactive for more than 1 hour with no activity and no users)
-    const activeUsersCount = room.users.size;
-    const hasMessagesOrFiles = room.messages.length > 0 || room.files.length > 0;
-    if (activeUsersCount === 0 && !hasMessagesOrFiles && (now - room.createdAt >= EXPIRATION_TIME)) {
-      rooms.delete(roomCode);
-      console.log(`Deleted empty/expired room: ${roomCode}`);
-    }
-  });
+  }
 }
 
-// Run cleanup check every 30 seconds
-setInterval(cleanupExpiredData, 30000);
+// --- API Endpoints ---
 
-// API Endpoints
-// File Upload Endpoint
+// 1. Get Application Configuration
+app.get('/api/config', (req, res) => {
+  res.json({
+    useVercelBlob: !!process.env.BLOB_READ_WRITE_TOKEN,
+    pusherKey: process.env.PUSHER_KEY || null,
+    pusherCluster: process.env.PUSHER_CLUSTER || null,
+  });
+});
+
+// 2. Create Room
+app.post('/api/rooms/create', async (req, res) => {
+  try {
+    const { nickname } = req.body;
+    if (!nickname) {
+      return res.status(400).json({ error: 'Nickname is required.' });
+    }
+
+    const code = await generateRoomCode();
+    const roomKey = `room:${code}`;
+
+    await redis.hset(roomKey, {
+      code: code,
+      createdAt: Date.now().toString(),
+      isLocked: 'false',
+      host: '' // Will be set when host joins/authenticates
+    });
+    
+    // Set 1 hour TTL
+    await redis.expire(roomKey, 3600);
+    await redis.expire(`${roomKey}:messages`, 3600);
+    await redis.expire(`${roomKey}:files`, 3600);
+    await redis.expire(`${roomKey}:users`, 3600);
+    await redis.expire(`${roomKey}:lobby`, 3600);
+
+    res.status(200).json({ success: true, roomCode: code });
+  } catch (error) {
+    console.error('Create room error:', error);
+    res.status(500).json({ error: 'Failed to create room.' });
+  }
+});
+
+// 3. Join Room
+app.post('/api/rooms/join', async (req, res) => {
+  try {
+    const { roomCode, nickname, socketId } = req.body;
+    const formattedCode = roomCode.toUpperCase().trim();
+    const roomKey = `room:${formattedCode}`;
+
+    const exists = await redis.exists(roomKey);
+    if (!exists) {
+      return res.status(400).json({ error: 'Room does not exist or has expired.' });
+    }
+
+    const room = await redis.hgetall(roomKey);
+    const isLocked = room.isLocked === 'true';
+    let host = room.host;
+
+    // Set first joiner as host
+    if (!host) {
+      host = socketId;
+      await redis.hset(roomKey, 'host', host);
+    }
+
+    // Refresh TTL
+    await redis.expire(roomKey, 3600);
+    await redis.expire(`${roomKey}:messages`, 3600);
+    await redis.expire(`${roomKey}:files`, 3600);
+    await redis.expire(`${roomKey}:users`, 3600);
+    await redis.expire(`${roomKey}:lobby`, 3600);
+
+    // Check Lobby / Lock State
+    if (isLocked && socketId !== host) {
+      await redis.hset(`${roomKey}:lobby`, socketId, nickname);
+      // Notify host of knock request
+      await triggerEvent(`private-host-${host}`, 'lobby-knock', {
+        socketId: socketId,
+        nickname: nickname
+      });
+      return res.status(200).json({ success: true, status: 'waiting' });
+    }
+
+    // Approve join immediately (unlocked or is host)
+    await redis.hset(`${roomKey}:users`, socketId, nickname);
+
+    // Get messages & files
+    const messagesRaw = await redis.lrange(`${roomKey}:messages`, 0, -1);
+    const filesRaw = await redis.lrange(`${roomKey}:files`, 0, -1);
+
+    const now = Date.now();
+    const messages = messagesRaw.map(m => typeof m === 'string' ? JSON.parse(m) : m)
+                                .filter(m => now - m.timestamp < EXPIRATION_TIME);
+    const files = filesRaw.map(f => typeof f === 'string' ? JSON.parse(f) : f)
+                          .filter(f => now - f.timestamp < EXPIRATION_TIME);
+
+    const usersMap = await redis.hgetall(`${roomKey}:users`) || {};
+    const userList = Object.entries(usersMap).map(([id, name]) => ({
+      socketId: id,
+      nickname: name
+    }));
+
+    // Notify others in room
+    await triggerEvent(`presence-room-${formattedCode}`, 'user-joined', {
+      nickname: nickname,
+      socketId: socketId,
+      users: userList,
+      systemMessage: {
+        id: 'msg-sys-' + Date.now(),
+        sender: 'System',
+        text: `${nickname} joined the room.`,
+        timestamp: Date.now()
+      }
+    });
+
+    res.status(200).json({
+      success: true,
+      status: 'approved',
+      roomCode: formattedCode,
+      messages: messages,
+      files: files,
+      users: userList,
+      hostSocketId: host,
+      isLocked: isLocked
+    });
+  } catch (error) {
+    console.error('Join room error:', error);
+    res.status(500).json({ error: 'Failed to join room.' });
+  }
+});
+
+// 4. Send Message
+app.post('/api/rooms/message', async (req, res) => {
+  try {
+    const { roomCode, sender, text } = req.body;
+    const formattedCode = roomCode.toUpperCase().trim();
+    const roomKey = `room:${formattedCode}`;
+
+    const exists = await redis.exists(roomKey);
+    if (!exists) {
+      return res.status(400).json({ error: 'Room does not exist or has expired.' });
+    }
+
+    const message = {
+      id: 'msg-' + Date.now() + '-' + Math.round(Math.random() * 1e9),
+      sender: sender,
+      text: text,
+      timestamp: Date.now()
+    };
+
+    await redis.rpush(`${roomKey}:messages`, JSON.stringify(message));
+    
+    // Broadcast message
+    await triggerEvent(`presence-room-${formattedCode}`, 'message-received', message);
+
+    res.status(200).json({ success: true, message });
+  } catch (error) {
+    console.error('Send message error:', error);
+    res.status(500).json({ error: 'Failed to send message.' });
+  }
+});
+
+// 5. Toggle Room Lock
+app.post('/api/rooms/toggle-lock', async (req, res) => {
+  try {
+    const { roomCode, socketId, locked } = req.body;
+    const formattedCode = roomCode.toUpperCase().trim();
+    const roomKey = `room:${formattedCode}`;
+
+    const host = await redis.hget(roomKey, 'host');
+    if (socketId !== host) {
+      return res.status(403).json({ error: 'Only the host can lock the room.' });
+    }
+
+    const isLockedStr = locked ? 'true' : 'false';
+    await redis.hset(roomKey, 'isLocked', isLockedStr);
+
+    const systemMessage = {
+      id: 'msg-sys-lock-' + Date.now(),
+      sender: 'System',
+      text: `Room has been ${locked ? 'locked (waiting lobby enabled)' : 'unlocked'}.`,
+      timestamp: Date.now()
+    };
+
+    await redis.rpush(`${roomKey}:messages`, JSON.stringify(systemMessage));
+
+    await triggerEvent(`presence-room-${formattedCode}`, 'lock-status-changed', { isLocked: locked });
+    await triggerEvent(`presence-room-${formattedCode}`, 'message-received', systemMessage);
+
+    res.status(200).json({ success: true, isLocked: locked });
+  } catch (error) {
+    console.error('Toggle lock error:', error);
+    res.status(500).json({ error: 'Failed to toggle lock.' });
+  }
+});
+
+// 6. Approve or Decline waiting lobby user
+app.post('/api/rooms/approve-join', async (req, res) => {
+  try {
+    const { roomCode, socketId, targetSocketId, approved } = req.body;
+    const formattedCode = roomCode.toUpperCase().trim();
+    const roomKey = `room:${formattedCode}`;
+
+    const host = await redis.hget(roomKey, 'host');
+    if (socketId !== host) {
+      return res.status(403).json({ error: 'Unauthorized.' });
+    }
+
+    const targetNickname = await redis.hget(`${roomKey}:lobby`, targetSocketId);
+    if (!targetNickname) {
+      return res.status(400).json({ error: 'User is not in the lobby.' });
+    }
+
+    await redis.hdel(`${roomKey}:lobby`, targetSocketId);
+
+    if (approved) {
+      await redis.hset(`${roomKey}:users`, targetSocketId, targetNickname);
+
+      const messagesRaw = await redis.lrange(`${roomKey}:messages`, 0, -1);
+      const filesRaw = await redis.lrange(`${roomKey}:files`, 0, -1);
+
+      const now = Date.now();
+      const messages = messagesRaw.map(m => typeof m === 'string' ? JSON.parse(m) : m)
+                                  .filter(m => now - m.timestamp < EXPIRATION_TIME);
+      const files = filesRaw.map(f => typeof f === 'string' ? JSON.parse(f) : f)
+                            .filter(f => now - f.timestamp < EXPIRATION_TIME);
+
+      const usersMap = await redis.hgetall(`${roomKey}:users`) || {};
+      const userList = Object.entries(usersMap).map(([id, name]) => ({
+        socketId: id,
+        nickname: name
+      }));
+
+      // Notify target client
+      await triggerEvent(`private-host-${targetSocketId}`, 'join-approved', {
+        roomCode: formattedCode,
+        messages: messages,
+        files: files,
+        users: userList,
+        hostSocketId: host,
+        isLocked: true
+      });
+
+      // Broadcast to other users
+      await triggerEvent(`presence-room-${formattedCode}`, 'user-joined', {
+        nickname: targetNickname,
+        socketId: targetSocketId,
+        users: userList,
+        systemMessage: {
+          id: 'msg-sys-' + Date.now(),
+          sender: 'System',
+          text: `${targetNickname} joined the room.`,
+          timestamp: Date.now()
+        }
+      });
+    } else {
+      await triggerEvent(`private-host-${targetSocketId}`, 'join-declined', {
+        reason: 'Your request to join was declined by the host.'
+      });
+    }
+
+    // Resolve lobby status on host UI
+    await triggerEvent(`private-host-${host}`, 'lobby-resolved', { socketId: targetSocketId });
+
+    res.status(200).json({ success: true });
+  } catch (error) {
+    console.error('Approve join error:', error);
+    res.status(500).json({ error: 'Failed to resolve join request.' });
+  }
+});
+
+// 7. Kick User
+app.post('/api/rooms/kick-user', async (req, res) => {
+  try {
+    const { roomCode, socketId, targetSocketId } = req.body;
+    const formattedCode = roomCode.toUpperCase().trim();
+    const roomKey = `room:${formattedCode}`;
+
+    const host = await redis.hget(roomKey, 'host');
+    if (socketId !== host) {
+      return res.status(403).json({ error: 'Unauthorized.' });
+    }
+
+    const targetNickname = await redis.hget(`${roomKey}:users`, targetSocketId);
+    if (!targetNickname) {
+      return res.status(400).json({ error: 'User is not in the room.' });
+    }
+
+    await redis.hdel(`${roomKey}:users`, targetSocketId);
+
+    const usersMap = await redis.hgetall(`${roomKey}:users`) || {};
+    const userList = Object.entries(usersMap).map(([id, name]) => ({
+      socketId: id,
+      nickname: name
+    }));
+
+    // Trigger kicked event for target user
+    await triggerEvent(`private-host-${targetSocketId}`, 'kicked', {});
+
+    // Broadcast to room
+    await triggerEvent(`presence-room-${formattedCode}`, 'user-left', {
+      nickname: targetNickname,
+      users: userList,
+      systemMessage: {
+        id: 'msg-sys-kick-' + Date.now(),
+        sender: 'System',
+        text: `${targetNickname} was removed by the host.`,
+        timestamp: Date.now()
+      }
+    });
+
+    res.status(200).json({ success: true });
+  } catch (error) {
+    console.error('Kick user error:', error);
+    res.status(500).json({ error: 'Failed to kick user.' });
+  }
+});
+
+// 8. User Heartbeat & Leave logic
+app.post('/api/rooms/heartbeat', async (req, res) => {
+  try {
+    const { roomCode, socketId, nickname } = req.body;
+    const formattedCode = roomCode.toUpperCase().trim();
+    const roomKey = `room:${formattedCode}`;
+
+    if (await redis.exists(roomKey)) {
+      await redis.hset(`${roomKey}:users`, socketId, nickname);
+    }
+    res.status(200).json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/rooms/leave', async (req, res) => {
+  try {
+    const { roomCode, socketId, nickname } = req.body;
+    const formattedCode = roomCode.toUpperCase().trim();
+    const roomKey = `room:${formattedCode}`;
+
+    if (!(await redis.exists(roomKey))) {
+      return res.status(200).json({ success: true });
+    }
+
+    await redis.hdel(`${roomKey}:users`, socketId);
+    await redis.hdel(`${roomKey}:lobby`, socketId);
+
+    const usersMap = await redis.hgetall(`${roomKey}:users`) || {};
+    const remainingUsers = Object.entries(usersMap);
+
+    const userList = remainingUsers.map(([id, name]) => ({
+      socketId: id,
+      nickname: name
+    }));
+
+    let host = await redis.hget(roomKey, 'host');
+    let hostTransferred = false;
+    let newHostName = '';
+
+    if (socketId === host) {
+      if (remainingUsers.length > 0) {
+        const nextHostId = remainingUsers[0][0];
+        newHostName = remainingUsers[0][1];
+        await redis.hset(roomKey, 'host', nextHostId);
+        host = nextHostId;
+        hostTransferred = true;
+      } else {
+        await redis.hdel(roomKey, 'host');
+        host = null;
+      }
+    }
+
+    // Broadcast user left
+    await triggerEvent(`presence-room-${formattedCode}`, 'user-left', {
+      nickname: nickname,
+      users: userList,
+      systemMessage: {
+        id: 'msg-sys-left-' + Date.now(),
+        sender: 'System',
+        text: `${nickname} left the room.`,
+        timestamp: Date.now()
+      }
+    });
+
+    if (hostTransferred && host) {
+      await triggerEvent(`presence-room-${formattedCode}`, 'host-transferred', {
+        hostSocketId: host,
+        nickname: newHostName,
+        systemMessage: {
+          id: 'msg-sys-host-' + Date.now(),
+          sender: 'System',
+          text: `${newHostName} is now the room host.`,
+          timestamp: Date.now()
+        }
+      });
+    }
+
+    // Delete room if completely empty
+    const messagesCount = await redis.lrange(`${roomKey}:messages`, 0, -1);
+    const filesCount = await redis.lrange(`${roomKey}:files`, 0, -1);
+    if (remainingUsers.length === 0 && messagesCount.length === 0 && filesCount.length === 0) {
+      await redis.del(roomKey);
+    }
+
+    res.status(200).json({ success: true });
+  } catch (error) {
+    console.error('Leave room error:', error);
+    res.status(500).json({ error: 'Failed to process leave room.' });
+  }
+});
+
+// 9. File Upload Metadata Registry (Vercel Blob Callback)
+app.post('/api/rooms/file-shared', async (req, res) => {
+  try {
+    const { roomCode, sender, originalName, mimeType, size, url } = req.body;
+    const formattedCode = roomCode.toUpperCase().trim();
+    const roomKey = `room:${formattedCode}`;
+
+    const exists = await redis.exists(roomKey);
+    if (!exists) {
+      return res.status(400).json({ error: 'Invalid room code.' });
+    }
+
+    const fileId = 'file-' + Date.now() + '-' + Math.round(Math.random() * 1e9);
+    const fileData = {
+      id: fileId,
+      originalName,
+      mimeType,
+      size,
+      path: url, // Serves as the download path
+      sender: sender || 'Anonymous',
+      timestamp: Date.now()
+    };
+
+    await redis.rpush(`${roomKey}:files`, JSON.stringify(fileData));
+
+    const systemMessage = {
+      id: 'msg-file-' + Date.now(),
+      sender: 'System',
+      text: `${sender || 'Someone'} shared a file: ${fileData.originalName}`,
+      timestamp: Date.now(),
+      file: {
+        id: fileData.id,
+        originalName: fileData.originalName,
+        size: fileData.size,
+        mimeType: fileData.mimeType
+      }
+    };
+    await redis.rpush(`${roomKey}:messages`, JSON.stringify(systemMessage));
+
+    // Broadcast file-shared event
+    await triggerEvent(`presence-room-${formattedCode}`, 'file-shared', {
+      file: fileData,
+      message: systemMessage
+    });
+
+    res.status(200).json({ success: true, file: fileData });
+  } catch (error) {
+    console.error('Register shared file error:', error);
+    res.status(500).json({ error: 'Failed to share file.' });
+  }
+});
+
+// 10. File Download Redirect
+app.get('/api/download/:fileId', async (req, res) => {
+  try {
+    const { fileId } = req.params;
+    
+    // Find file across all active rooms
+    // We can scan keys with Redis, or search the current active room list
+    // In MockRedis/Redis, we list keys with pattern `room:*:files`
+    // Since Upstash Redis doesn't easily support scan without keys count, we can read rooms
+    // An alternative is a global files index, or we look up room codes
+    // For simplicity, search through known active room files in Redis.
+    // However, since Redis is distributed, we can search by keeping a list of files or scanning
+    // Let's do a search on all active room keys
+    // In serverless, since we want this fast, let's keep a global index of files: `files:index` (Hash fileId -> roomCode)
+    // Or we scan. Let's do file lookup by reading from Redis directly.
+    // To make it easy: let's scan all keys starting with `room:`
+    // On Upstash, let's just get the file index or find the roomCode from fileId
+    // Let's add a key `file:${fileId}` when files are created!
+    // That makes lookup O(1) and extremely fast!
+    // Yes! Let's update `file-shared` above to write `await redis.hset("file:" + fileId, fileData)` and set a 1 hour TTL!
+    // That is brilliant!
+    
+    const fileDataRaw = await redis.hgetall(`file:${fileId}`);
+    if (!fileDataRaw) {
+      return res.status(404).send('File not found or has expired.');
+    }
+
+    const now = Date.now();
+    if (now - parseInt(fileDataRaw.timestamp) >= EXPIRATION_TIME) {
+      // Delete from Vercel Blob if URL matches and it's Vercel Blob
+      if (fileDataRaw.path.includes('public.blob.vercel-storage.com')) {
+        try {
+          await del(fileDataRaw.path);
+        } catch (e) {
+          console.error('Failed to delete blob from Vercel storage:', e);
+        }
+      }
+      await redis.del(`file:${fileId}`);
+      return res.status(404).send('File has expired.');
+    }
+
+    // Redirect to Vercel Blob URL or download local file
+    if (fileDataRaw.path.startsWith('http://') || fileDataRaw.path.startsWith('https://')) {
+      res.redirect(fileDataRaw.path);
+    } else {
+      // Local fallback file path
+      const localPath = path.resolve(fileDataRaw.path);
+      if (fs.existsSync(localPath)) {
+        res.download(localPath, fileDataRaw.originalName);
+      } else {
+        res.status(404).send('Local file missing from server.');
+      }
+    }
+  } catch (error) {
+    console.error('Download error:', error);
+    res.status(500).send('Download error occurred.');
+  }
+});
+
+// Update `/api/rooms/file-shared` implementation to write the quick lookup index
+app.post('/api/rooms/file-shared', async (req, res) => {
+  try {
+    const { roomCode, sender, originalName, mimeType, size, url } = req.body;
+    const formattedCode = roomCode.toUpperCase().trim();
+    const roomKey = `room:${formattedCode}`;
+
+    const exists = await redis.exists(roomKey);
+    if (!exists) {
+      return res.status(400).json({ error: 'Invalid room code.' });
+    }
+
+    const fileId = 'file-' + Date.now() + '-' + Math.round(Math.random() * 1e9);
+    const fileData = {
+      id: fileId,
+      originalName,
+      mimeType,
+      size: size.toString(),
+      path: url,
+      sender: sender || 'Anonymous',
+      timestamp: Date.now().toString()
+    };
+
+    // Store in room list
+    await redis.rpush(`${roomKey}:files`, JSON.stringify(fileData));
+    
+    // Store in global fast-lookup index (TTL 1 hour)
+    await redis.hset(`file:${fileId}`, fileData);
+    await redis.expire(`file:${fileId}`, 3600);
+
+    const systemMessage = {
+      id: 'msg-file-' + Date.now(),
+      sender: 'System',
+      text: `${sender || 'Someone'} shared a file: ${fileData.originalName}`,
+      timestamp: Date.now(),
+      file: {
+        id: fileData.id,
+        originalName: fileData.originalName,
+        size: parseInt(fileData.size),
+        mimeType: fileData.mimeType
+      }
+    };
+    await redis.rpush(`${roomKey}:messages`, JSON.stringify(systemMessage));
+
+    // Broadcast file-shared event
+    await triggerEvent(`presence-room-${formattedCode}`, 'file-shared', {
+      file: { ...fileData, size: parseInt(fileData.size), timestamp: parseInt(fileData.timestamp) },
+      message: systemMessage
+    });
+
+    res.status(200).json({ success: true, file: fileData });
+  } catch (error) {
+    console.error('Register shared file error:', error);
+    res.status(500).json({ error: 'Failed to share file.' });
+  }
+});
+
+// 11. Local Upload Endpoint (Fallback for local development)
 app.post('/api/upload', (req, res) => {
-  upload.single('file')(req, res, (err) => {
+  upload.single('file')(req, res, async (err) => {
     if (err) {
       if (err.code === 'LIMIT_FILE_SIZE') {
         return res.status(400).json({ error: 'File is too large. Capped at 50MB.' });
@@ -127,399 +761,137 @@ app.post('/api/upload', (req, res) => {
         return res.status(400).json({ error: 'No file uploaded.' });
       }
 
-      const { roomCode, sender } = req.body;
-      if (!roomCode || !rooms.has(roomCode)) {
-        // Clean up uploaded file if room doesn't exist
-        fs.unlinkSync(req.file.path);
-        return res.status(400).json({ error: 'Invalid room code.' });
-      }
-
-      const room = rooms.get(roomCode);
-      const fileId = 'file-' + Date.now() + '-' + Math.round(Math.random() * 1e9);
-      
-      const fileData = {
-        id: fileId,
-        originalName: req.file.originalname,
-        mimeType: req.file.mimetype,
-        size: req.file.size,
-        path: req.file.path,
-        sender: sender || 'Anonymous',
-        timestamp: Date.now()
-      };
-
-      room.files.push(fileData);
-
-      // Create a special chat message to announce file sharing
-      const systemMessage = {
-        id: 'msg-file-' + Date.now(),
-        sender: 'System',
-        text: `${sender || 'Someone'} shared a file: ${fileData.originalName}`,
-        timestamp: Date.now(),
-        file: {
-          id: fileData.id,
-          originalName: fileData.originalName,
-          size: fileData.size,
-          mimeType: fileData.mimeType
-        }
-      };
-      room.messages.push(systemMessage);
-
-      // Broadcast file and system message to room
-      io.to(roomCode).emit('file-shared', { file: fileData, message: systemMessage });
-
-      res.status(200).json({ success: true, file: fileData });
+      // Convert local path to a relative URL for download
+      // Since it's stored in public/uploads/ filename
+      const fileUrl = `/uploads/${req.file.filename}`;
+      res.status(200).json({ success: true, url: fileUrl });
     } catch (error) {
-      console.error('Upload error:', error);
+      console.error('Local upload API error:', error);
       res.status(500).json({ error: 'File upload failed.' });
     }
   });
 });
 
-// File Download Endpoint
-app.get('/api/download/:fileId', (req, res) => {
-  const { fileId } = req.params;
-  let foundFile = null;
+// 12. Vercel Blob Token Generation
+app.post('/api/upload-token', async (req, res) => {
+  const body = req.body;
+  try {
+    if (!process.env.BLOB_READ_WRITE_TOKEN) {
+      return res.status(400).json({ error: 'Vercel Blob token is missing.' });
+    }
 
-  // Search through all rooms to find the file
-  for (const room of rooms.values()) {
-    foundFile = room.files.find(f => f.id === fileId);
-    if (foundFile) break;
+    const jsonResponse = await handleUpload({
+      body,
+      request: req,
+      onBeforeGenerateToken: async (pathname) => {
+        return {
+          allowedContentTypes: undefined, // Allow all file types
+          tokenPayload: JSON.stringify({
+            // Put metadata here if needed
+          }),
+        };
+      },
+      onUploadCompleted: async ({ blob, tokenPayload }) => {
+        console.log('Blob upload finished successfully:', blob.url);
+      },
+    });
+
+    res.json(jsonResponse);
+  } catch (error) {
+    console.error('Token generation error:', error);
+    res.status(400).json({ error: error.message });
   }
-
-  if (!foundFile) {
-    return res.status(404).send('File not found or has expired.');
-  }
-
-  // Check if file exists on disk
-  if (!fs.existsSync(foundFile.path)) {
-    return res.status(404).send('File missing from server.');
-  }
-
-  res.download(foundFile.path, foundFile.originalName);
 });
 
-// Socket.io Connection Logic
-io.on('connection', (socket) => {
-  // socket.roomCode and socket.nickname will hold the state for this socket
+// 13. Pusher Auth Endpoint
+app.post('/api/pusher/auth', (req, res) => {
+  if (!pusher) {
+    return res.status(400).send('Pusher is not configured.');
+  }
 
-  // Handle Room Creation
-  socket.on('create-room', ({ nickname }, callback) => {
-    const code = generateRoomCode();
-    const newRoom = {
-      code: code,
-      createdAt: Date.now(),
-      messages: [],
-      files: [],
-      users: new Map(), // socket.id -> nickname
-      host: null,       // socket.id of host
-      isLocked: false,
-      waitingLobby: new Map() // socket.id -> nickname
-    };
-    
-    rooms.set(code, newRoom);
-    callback({ success: true, roomCode: code });
-  });
+  const socketId = req.body.socket_id;
+  const channel = req.body.channel_name;
+  const nickname = req.body.nickname;
+  const userId = req.body.userId || socketId;
 
-  // Handle Joining Room
-  socket.on('join-room', ({ roomCode, nickname }, callback) => {
+  const presenceData = {
+    user_id: userId,
+    user_info: { nickname },
+  };
+
+  try {
+    const auth = pusher.authorizeChannel(socketId, channel, presenceData);
+    res.send(auth);
+  } catch (error) {
+    console.error('Pusher auth error:', error);
+    res.status(500).send(error.toString());
+  }
+});
+
+// 14. Polling Fallback updates for local development without Pusher
+app.get('/api/rooms/:roomCode/updates', async (req, res) => {
+  try {
+    const { roomCode } = req.params;
     const formattedCode = roomCode.toUpperCase().trim();
-    if (!rooms.has(formattedCode)) {
-      return callback({ success: false, error: 'Room does not exist or has expired.' });
+    const roomKey = `room:${formattedCode}`;
+
+    const exists = await redis.exists(roomKey);
+    if (!exists) {
+      return res.status(404).json({ error: 'Room expired or deleted.' });
     }
 
-    const room = rooms.get(formattedCode);
-    const cleanedNickname = nickname.trim() || 'Anonymous';
+    // Refresh TTL
+    await redis.expire(roomKey, 3600);
+    await redis.expire(`${roomKey}:messages`, 3600);
+    await redis.expire(`${roomKey}:files`, 3600);
+    await redis.expire(`${roomKey}:users`, 3600);
+    await redis.expire(`${roomKey}:lobby`, 3600);
 
-    // Prevent double join
-    if (room.users.has(socket.id)) {
-      return callback({ success: false, error: 'You are already in this room.' });
-    }
+    const room = await redis.hgetall(roomKey);
+    const host = room.host;
+    const isLocked = room.isLocked === 'true';
 
-    // Set first joiner as host
-    if (!room.host) {
-      room.host = socket.id;
-    }
+    const messagesRaw = await redis.lrange(`${roomKey}:messages`, 0, -1);
+    const filesRaw = await redis.lrange(`${roomKey}:files`, 0, -1);
 
-    // Check Lobby / Lock State
-    if (room.isLocked && socket.id !== room.host) {
-      room.waitingLobby.set(socket.id, cleanedNickname);
-      // Notify host of knock request
-      io.to(room.host).emit('lobby-knock', {
-        socketId: socket.id,
-        nickname: cleanedNickname
-      });
-      return callback({ success: true, status: 'waiting' });
-    }
-
-    // Approve join immediately (unlocked or is host)
-    socket.roomCode = formattedCode;
-    socket.nickname = cleanedNickname;
-    room.users.set(socket.id, cleanedNickname);
-
-    socket.join(formattedCode);
-
-    // Get active messages and files
     const now = Date.now();
-    const activeMessages = room.messages.filter(msg => now - msg.timestamp < EXPIRATION_TIME);
-    const activeFiles = room.files.filter(file => now - file.timestamp < EXPIRATION_TIME).map(f => ({
-      id: f.id,
-      originalName: f.originalName,
-      size: f.size,
-      mimeType: f.mimeType,
-      sender: f.sender,
-      timestamp: f.timestamp
-    }));
+    const messages = messagesRaw.map(m => typeof m === 'string' ? JSON.parse(m) : m)
+                                .filter(m => now - m.timestamp < EXPIRATION_TIME);
+    const files = filesRaw.map(f => typeof f === 'string' ? JSON.parse(f) : f)
+                          .filter(f => now - f.timestamp < EXPIRATION_TIME);
 
-    const userList = Array.from(room.users.entries()).map(([id, name]) => ({
+    const usersMap = await redis.hgetall(`${roomKey}:users`) || {};
+    const userList = Object.entries(usersMap).map(([id, name]) => ({
       socketId: id,
       nickname: name
     }));
 
-    callback({
+    const lobbyMap = await redis.hgetall(`${roomKey}:lobby`) || {};
+    const lobbyList = Object.entries(lobbyMap).map(([id, name]) => ({
+      socketId: id,
+      nickname: name
+    }));
+
+    res.status(200).json({
       success: true,
-      status: 'approved',
-      roomCode: formattedCode,
-      messages: activeMessages,
-      files: activeFiles,
+      messages,
+      files,
       users: userList,
-      hostSocketId: room.host,
-      isLocked: room.isLocked
+      lobby: lobbyList,
+      host,
+      isLocked
     });
-
-    // Notify other users in the room
-    socket.to(formattedCode).emit('user-joined', {
-      nickname: cleanedNickname,
-      socketId: socket.id,
-      users: userList,
-      systemMessage: {
-        id: 'msg-sys-' + Date.now(),
-        sender: 'System',
-        text: `${cleanedNickname} joined the room.`,
-        timestamp: Date.now()
-      }
-    });
-  });
-
-  // Handle Waiting User Approval (from Host)
-  socket.on('approve-join', ({ targetSocketId, approved }) => {
-    const roomCode = socket.roomCode;
-    if (!roomCode || !rooms.has(roomCode)) return;
-
-    const room = rooms.get(roomCode);
-    if (socket.id !== room.host) return; // Only host approves
-
-    if (!room.waitingLobby.has(targetSocketId)) return;
-
-    const targetNickname = room.waitingLobby.get(targetSocketId);
-    room.waitingLobby.delete(targetSocketId);
-
-    const targetSocket = io.sockets.sockets.get(targetSocketId);
-
-    if (approved) {
-      if (targetSocket) {
-        targetSocket.roomCode = roomCode;
-        targetSocket.nickname = targetNickname;
-        room.users.set(targetSocketId, targetNickname);
-        targetSocket.join(roomCode);
-
-        const now = Date.now();
-        const activeMessages = room.messages.filter(msg => now - msg.timestamp < EXPIRATION_TIME);
-        const activeFiles = room.files.filter(file => now - file.timestamp < EXPIRATION_TIME).map(f => ({
-          id: f.id,
-          originalName: f.originalName,
-          size: f.size,
-          mimeType: f.mimeType,
-          sender: f.sender,
-          timestamp: f.timestamp
-        }));
-
-        const userList = Array.from(room.users.entries()).map(([id, name]) => ({
-          socketId: id,
-          nickname: name
-        }));
-
-        // Send approval to wait user
-        targetSocket.emit('join-approved', {
-          roomCode: roomCode,
-          messages: activeMessages,
-          files: activeFiles,
-          users: userList,
-          hostSocketId: room.host,
-          isLocked: room.isLocked
-        });
-
-        // Broadcast user joined to other users
-        targetSocket.to(roomCode).emit('user-joined', {
-          nickname: targetNickname,
-          socketId: targetSocketId,
-          users: userList,
-          systemMessage: {
-            id: 'msg-sys-' + Date.now(),
-            sender: 'System',
-            text: `${targetNickname} joined the room.`,
-            timestamp: Date.now()
-          }
-        });
-      }
-    } else {
-      // Decline user request
-      if (targetSocket) {
-        targetSocket.emit('join-declined', { reason: 'Your request to join was declined by the host.' });
-      }
-    }
-    
-    // Clean up host list
-    socket.emit('lobby-resolved', { socketId: targetSocketId });
-  });
-
-  // Handle Room Lock Toggle (from Host)
-  socket.on('toggle-lock', ({ locked }) => {
-    const roomCode = socket.roomCode;
-    if (!roomCode || !rooms.has(roomCode)) return;
-
-    const room = rooms.get(roomCode);
-    if (socket.id !== room.host) return;
-
-    room.isLocked = !!locked;
-    
-    io.to(roomCode).emit('lock-status-changed', { isLocked: room.isLocked });
-
-    // System announce in chat
-    const systemMessage = {
-      id: 'msg-sys-lock-' + Date.now(),
-      sender: 'System',
-      text: `Room has been ${room.isLocked ? 'locked (waiting lobby enabled)' : 'unlocked'}.`,
-      timestamp: Date.now()
-    };
-    room.messages.push(systemMessage);
-    io.to(roomCode).emit('message-received', systemMessage);
-  });
-
-  // Handle Kick User (from Host)
-  socket.on('kick-user', ({ targetSocketId }) => {
-    const roomCode = socket.roomCode;
-    if (!roomCode || !rooms.has(roomCode)) return;
-
-    const room = rooms.get(roomCode);
-    if (socket.id !== room.host) return;
-
-    if (!room.users.has(targetSocketId)) return;
-
-    const targetNickname = room.users.get(targetSocketId);
-    room.users.delete(targetSocketId);
-
-    const targetSocket = io.sockets.sockets.get(targetSocketId);
-    if (targetSocket) {
-      targetSocket.emit('kicked');
-      targetSocket.leave(roomCode);
-      targetSocket.roomCode = null;
-      targetSocket.nickname = null;
-    }
-
-    const userList = Array.from(room.users.entries()).map(([id, name]) => ({
-      socketId: id,
-      nickname: name
-    }));
-
-    io.to(roomCode).emit('user-left', {
-      nickname: targetNickname,
-      users: userList,
-      systemMessage: {
-        id: 'msg-sys-kick-' + Date.now(),
-        sender: 'System',
-        text: `${targetNickname} was removed by the host.`,
-        timestamp: Date.now()
-      }
-    });
-  });
-
-  // Handle Chat Message
-  socket.on('send-message', ({ text }) => {
-    const roomCode = socket.roomCode;
-    if (!roomCode || !rooms.has(roomCode)) return;
-
-    const room = rooms.get(roomCode);
-    const message = {
-      id: 'msg-' + Date.now() + '-' + Math.round(Math.random() * 1e9),
-      sender: socket.nickname,
-      text: text,
-      timestamp: Date.now()
-    };
-
-    room.messages.push(message);
-
-    // Broadcast message to room
-    io.to(roomCode).emit('message-received', message);
-  });
-
-  // Handle User Disconnect
-  socket.on('disconnect', () => {
-    // Check wait lobby
-    rooms.forEach((room, roomCode) => {
-      if (room.waitingLobby.has(socket.id)) {
-        room.waitingLobby.delete(socket.id);
-        io.to(room.host).emit('lobby-left', { socketId: socket.id });
-      }
-    });
-
-    const roomCode = socket.roomCode;
-    if (roomCode && rooms.has(roomCode)) {
-      const room = rooms.get(roomCode);
-      room.users.delete(socket.id);
-
-      const userList = Array.from(room.users.entries()).map(([id, name]) => ({
-        socketId: id,
-        nickname: name
-      }));
-
-      // Host transfer check
-      let hostTransferred = false;
-      let newHostName = '';
-      if (socket.id === room.host) {
-        if (room.users.size > 0) {
-          const nextHostId = room.users.keys().next().value;
-          room.host = nextHostId;
-          newHostName = room.users.get(nextHostId);
-          hostTransferred = true;
-        } else {
-          room.host = null;
-        }
-      }
-
-      socket.to(roomCode).emit('user-left', {
-        nickname: socket.nickname,
-        users: userList,
-        systemMessage: {
-          id: 'msg-sys-left-' + Date.now(),
-          sender: 'System',
-          text: `${socket.nickname} left the room.`,
-          timestamp: Date.now()
-        }
-      });
-
-      if (hostTransferred && room.host) {
-        io.to(roomCode).emit('host-transferred', {
-          hostSocketId: room.host,
-          nickname: newHostName,
-          systemMessage: {
-            id: 'msg-sys-host-' + Date.now(),
-            sender: 'System',
-            text: `${newHostName} is now the room host.`,
-            timestamp: Date.now()
-          }
-        });
-      }
-
-      // If room is empty, clear it
-      if (room.users.size === 0 && room.messages.length === 0 && room.files.length === 0) {
-        rooms.delete(roomCode);
-      }
-    }
-  });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
 });
 
-// Start Server
+// Conditionally start local server (Vercel manages execution in production)
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-});
+if (!process.env.VERCEL) {
+  app.listen(PORT, () => {
+    console.log(`Server running locally on port ${PORT}`);
+  });
+}
+
+module.exports = app;

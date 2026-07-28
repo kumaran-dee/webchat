@@ -1,13 +1,4 @@
-// Connect to Socket.io (Served from same host)
-const socket = io();
-
-// Check if kicked recently (Genius UX check across reload)
-if (sessionStorage.getItem('vanishchat_kicked') === 'true') {
-  sessionStorage.removeItem('vanishchat_kicked');
-  setTimeout(() => {
-    showToast('You were removed from the room by the host.', 'error');
-  }, 300);
-}
+import { upload } from 'https://esm.sh/@vercel/blob/client';
 
 // Application State
 let state = {
@@ -20,6 +11,25 @@ let state = {
   isLocked: false,
   waitingNickname: null
 };
+
+// Generate or retrieve a unique local client ID (replaces socket.id)
+let socketId = sessionStorage.getItem('webchat_socket_id');
+if (!socketId) {
+  socketId = 'client-' + Date.now() + '-' + Math.round(Math.random() * 1e9);
+  sessionStorage.setItem('webchat_socket_id', socketId);
+}
+
+// Fetch App configuration dynamically
+const configRes = await fetch('/api/config');
+const config = await configRes.json();
+
+// Check if kicked recently (Genius UX check across reload)
+if (sessionStorage.getItem('vanishchat_kicked') === 'true') {
+  sessionStorage.removeItem('vanishchat_kicked');
+  setTimeout(() => {
+    showToast('You were removed from the room by the host.', 'error');
+  }, 300);
+}
 
 // DOM Elements
 const el = {
@@ -70,6 +80,326 @@ const el = {
   toastContainer: document.getElementById('toast-container'),
   lobbyRequestsContainer: document.getElementById('lobby-requests-container')
 };
+
+// --- Real-time Subscription (Pusher) & Polling Fallback Setup ---
+let pusher = null;
+let roomChannel = null;
+let hostChannel = null;
+let pollingInterval = null;
+let lastKnownMessagesCount = 0;
+let lastKnownFilesCount = 0;
+
+if (config.pusherKey) {
+  pusher = new Pusher(config.pusherKey, {
+    cluster: config.pusherCluster,
+    authEndpoint: '/api/pusher/auth'
+  });
+
+  pusher.connection.bind('state_change', (states) => {
+    const current = states.current;
+    if (current === 'connected') {
+      el.connectionStatus.innerText = 'Connected';
+      el.statusPulse.style.backgroundColor = 'var(--success)';
+      el.statusPulse.style.boxShadow = '0 0 8px var(--success)';
+    } else {
+      el.connectionStatus.innerText = 'Connecting...';
+      el.statusPulse.style.backgroundColor = 'var(--danger)';
+      el.statusPulse.style.boxShadow = '0 0 8px var(--danger)';
+    }
+  });
+} else {
+  console.warn("Pusher key missing. Real-time functions will use polling.");
+  el.connectionStatus.innerText = 'Connected (Polling)';
+  el.statusPulse.style.backgroundColor = 'var(--success)';
+  el.statusPulse.style.boxShadow = '0 0 8px var(--success)';
+}
+
+function subscribeToHostEvents(roomCode, nickname) {
+  if (!pusher) return;
+
+  // Set Pusher auth payload dynamically
+  pusher.config.auth = {
+    params: {
+      nickname: nickname,
+      userId: socketId
+    }
+  };
+
+  const channelName = `private-host-${socketId}`;
+  if (hostChannel) pusher.unsubscribe(hostChannel.name);
+
+  hostChannel = pusher.subscribe(channelName);
+
+  hostChannel.bind('join-approved', (data) => {
+    setupRoom(data, state.waitingNickname || nickname);
+    state.waitingNickname = null;
+    showToast('Host approved your join request!', 'success');
+  });
+
+  hostChannel.bind('join-declined', (data) => {
+    showView('landing');
+    showToast(data.reason || 'Your join request was declined by the host.', 'error');
+    state.waitingNickname = null;
+  });
+
+  hostChannel.bind('kicked', () => {
+    sessionStorage.setItem('vanishchat_kicked', 'true');
+    window.location.reload();
+  });
+
+  hostChannel.bind('lobby-knock', (data) => {
+    if (document.getElementById(`knock-req-${data.socketId}`)) return;
+
+    const card = document.createElement('div');
+    card.className = 'request-card';
+    card.id = `knock-req-${data.socketId}`;
+    card.innerHTML = `
+      <div class="request-info">
+        <strong>${data.nickname}</strong> wants to join the chat
+      </div>
+      <div class="request-actions">
+        <button class="btn-approve btn-approve-accept">Accept</button>
+        <button class="btn-approve btn-approve-decline">Decline</button>
+      </div>
+    `;
+
+    card.querySelector('.btn-approve-accept').addEventListener('click', async () => {
+      await fetch('/api/rooms/approve-join', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ roomCode, socketId, targetSocketId: data.socketId, approved: true })
+      });
+    });
+    card.querySelector('.btn-approve-decline').addEventListener('click', async () => {
+      await fetch('/api/rooms/approve-join', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ roomCode, socketId, targetSocketId: data.socketId, approved: false })
+      });
+    });
+
+    el.lobbyRequestsContainer.appendChild(card);
+    showToast(`Entry request from ${data.nickname}`, 'info');
+  });
+
+  hostChannel.bind('lobby-resolved', (data) => {
+    const card = document.getElementById(`knock-req-${data.socketId}`);
+    if (card) card.remove();
+  });
+
+  hostChannel.bind('lobby-left', (data) => {
+    const card = document.getElementById(`knock-req-${data.socketId}`);
+    if (card) card.remove();
+  });
+}
+
+function subscribeToRoomEvents(roomCode, nickname) {
+  if (!pusher) return;
+
+  const channelName = `presence-room-${roomCode}`;
+  if (roomChannel) pusher.unsubscribe(roomChannel.name);
+
+  roomChannel = pusher.subscribe(channelName);
+
+  roomChannel.bind('user-joined', (data) => {
+    state.users = data.users;
+    updateUsersCountUI();
+    renderAllUsers();
+    appendSystemMessage(data.systemMessage.text);
+    showToast(`${data.nickname} joined the room.`, 'info');
+  });
+
+  roomChannel.bind('user-left', (data) => {
+    state.users = data.users;
+    updateUsersCountUI();
+    renderAllUsers();
+    appendSystemMessage(data.systemMessage.text);
+    showToast(`${data.nickname} left the room.`, 'info');
+  });
+
+  roomChannel.bind('message-received', (message) => {
+    appendMessage(message);
+    scrollToBottom();
+  });
+
+  roomChannel.bind('file-shared', (data) => {
+    state.files.push(data.file);
+    renderAllFiles();
+    appendMessage(data.message);
+    scrollToBottom();
+    showToast(`${data.file.sender} uploaded: ${data.file.originalName}`, 'success');
+  });
+
+  roomChannel.bind('lock-status-changed', (data) => {
+    state.isLocked = data.isLocked;
+    el.lockRoomToggle.checked = data.isLocked;
+  });
+
+  roomChannel.bind('host-transferred', (data) => {
+    state.hostSocketId = data.hostSocketId;
+    state.isHost = (socketId === data.hostSocketId);
+    
+    if (state.isHost) {
+      el.lockRoomWrapper.classList.remove('hidden');
+      el.lockRoomToggle.checked = state.isLocked;
+      showToast('You are now the room host!', 'success');
+    } else {
+      el.lockRoomWrapper.classList.add('hidden');
+    }
+
+    renderAllUsers();
+    appendSystemMessage(data.systemMessage.text);
+  });
+}
+
+function startPolling(roomCode, nickname) {
+  if (pollingInterval) clearInterval(pollingInterval);
+
+  const sendHeartbeat = async () => {
+    try {
+      await fetch('/api/rooms/heartbeat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ roomCode, socketId, nickname })
+      });
+    } catch (e) {
+      console.error('Heartbeat error:', e);
+    }
+  };
+
+  const poll = async () => {
+    try {
+      const res = await fetch(`/api/rooms/${roomCode}/updates`);
+      if (res.status === 404) {
+        clearInterval(pollingInterval);
+        showToast('Room expired or has been deleted.', 'error');
+        setTimeout(() => window.location.reload(), 2000);
+        return;
+      }
+      const data = await res.json();
+      if (!data.success) return;
+
+      const inUsers = data.users.some(u => u.socketId === socketId);
+      const inLobby = data.lobby.some(u => u.socketId === socketId);
+
+      if (state.waitingNickname) {
+        if (inUsers) {
+          state.waitingNickname = null;
+          setupRoom({
+            roomCode,
+            messages: data.messages,
+            files: data.files,
+            users: data.users,
+            hostSocketId: data.host,
+            isLocked: data.isLocked
+          }, nickname);
+          showToast('Host approved your join request!', 'success');
+        } else if (!inLobby) {
+          state.waitingNickname = null;
+          showView('landing');
+          showToast('Your join request was declined by the host.', 'error');
+          clearInterval(pollingInterval);
+        }
+        return;
+      }
+
+      if (!inUsers && state.roomCode) {
+        sessionStorage.setItem('vanishchat_kicked', 'true');
+        window.location.reload();
+        return;
+      }
+
+      // Update local state
+      state.users = data.users;
+      state.files = data.files;
+      state.hostSocketId = data.host;
+      state.isHost = (socketId === data.host);
+      
+      const wasLocked = state.isLocked;
+      state.isLocked = data.isLocked;
+
+      if (state.isHost) {
+        el.lockRoomWrapper.classList.remove('hidden');
+        el.lockRoomToggle.checked = state.isLocked;
+      } else {
+        el.lockRoomWrapper.classList.add('hidden');
+      }
+
+      if (wasLocked !== state.isLocked) {
+        showToast(`Room has been ${state.isLocked ? 'locked' : 'unlocked'}.`, 'info');
+      }
+
+      updateUsersCountUI();
+      renderAllUsers();
+
+      if (data.messages.length !== lastKnownMessagesCount) {
+        el.messagesContainer.innerHTML = '';
+        data.messages.forEach(msg => appendMessage(msg));
+        scrollToBottom();
+        lastKnownMessagesCount = data.messages.length;
+      }
+
+      if (data.files.length !== lastKnownFilesCount) {
+        renderAllFiles();
+        lastKnownFilesCount = data.files.length;
+      }
+
+      if (state.isHost) {
+        const existingCards = el.lobbyRequestsContainer.querySelectorAll('.request-card');
+        existingCards.forEach(c => {
+          const id = c.id.replace('knock-req-', '');
+          if (!data.lobby.some(u => u.socketId === id)) {
+            c.remove();
+          }
+        });
+
+        data.lobby.forEach(user => {
+          if (!document.getElementById(`knock-req-${user.socketId}`)) {
+            const card = document.createElement('div');
+            card.className = 'request-card';
+            card.id = `knock-req-${user.socketId}`;
+            card.innerHTML = `
+              <div class="request-info">
+                <strong>${user.nickname}</strong> wants to join the chat
+              </div>
+              <div class="request-actions">
+                <button class="btn-approve btn-approve-accept">Accept</button>
+                <button class="btn-approve btn-approve-decline">Decline</button>
+              </div>
+            `;
+
+            card.querySelector('.btn-approve-accept').addEventListener('click', async () => {
+              await fetch('/api/rooms/approve-join', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ roomCode, socketId, targetSocketId: user.socketId, approved: true })
+              });
+            });
+            card.querySelector('.btn-approve-decline').addEventListener('click', async () => {
+              await fetch('/api/rooms/approve-join', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ roomCode, socketId, targetSocketId: user.socketId, approved: false })
+              });
+            });
+
+            el.lobbyRequestsContainer.appendChild(card);
+            showToast(`Entry request from ${user.nickname}`, 'info');
+          }
+        });
+      }
+    } catch (e) {
+      console.error('Polling error:', e);
+    }
+  };
+
+  sendHeartbeat();
+  poll();
+  pollingInterval = setInterval(() => {
+    poll();
+    sendHeartbeat();
+  }, 3000);
+}
 
 // --- View Router ---
 function showView(view) {
@@ -144,33 +474,27 @@ function showToast(message, type = 'info') {
   }, 4000);
 }
 
-// --- Connection Status Indicators ---
-socket.on('connect', () => {
-  el.connectionStatus.innerText = 'Connected';
-  el.statusPulse.style.backgroundColor = 'var(--success)';
-  el.statusPulse.style.boxShadow = '0 0 8px var(--success)';
-});
-
-socket.on('disconnect', () => {
-  el.connectionStatus.innerText = 'Disconnected. Retrying...';
-  el.statusPulse.style.backgroundColor = 'var(--danger)';
-  el.statusPulse.style.boxShadow = '0 0 8px var(--danger)';
-  showToast('Connection to server lost. Trying to reconnect...', 'error');
-});
-
 // --- Action: Create Room ---
-el.createForm.addEventListener('submit', (e) => {
+el.createForm.addEventListener('submit', async (e) => {
   e.preventDefault();
   const nickname = el.createNickname.value.trim();
   if (!nickname) return;
 
-  socket.emit('create-room', { nickname }, (response) => {
+  try {
+    const res = await fetch('/api/rooms/create', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ nickname })
+    });
+    const response = await res.json();
     if (response.success) {
       joinRoom(response.roomCode, nickname);
     } else {
-      showToast('Failed to create room. Try again.', 'error');
+      showToast(response.error || 'Failed to create room. Try again.', 'error');
     }
-  });
+  } catch (error) {
+    showToast('Network error creating room.', 'error');
+  }
 });
 
 // --- Action: Join Room ---
@@ -184,21 +508,37 @@ el.joinForm.addEventListener('submit', (e) => {
 });
 
 // --- Join Room Core Logic ---
-function joinRoom(roomCode, nickname) {
-  socket.emit('join-room', { roomCode, nickname }, (response) => {
+async function joinRoom(roomCode, nickname) {
+  try {
+    const res = await fetch('/api/rooms/join', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ roomCode, nickname, socketId })
+    });
+    const response = await res.json();
+
     if (response.success) {
       if (response.status === 'waiting') {
         state.waitingNickname = nickname;
         el.waitNickname.innerText = nickname;
         showView('waiting');
         showToast('Room is locked. Waiting for host approval...', 'info');
+
+        if (pusher) {
+          subscribeToHostEvents(roomCode, nickname);
+        } else {
+          startPolling(roomCode, nickname);
+        }
         return;
       }
+      
       setupRoom(response, nickname);
     } else {
       showToast(response.error || 'Failed to join room.', 'error');
     }
-  });
+  } catch (error) {
+    showToast('Network error joining room.', 'error');
+  }
 }
 
 // Setup Room state & populate interface
@@ -208,8 +548,12 @@ function setupRoom(response, nickname) {
   state.users = response.users;
   state.files = response.files;
   state.hostSocketId = response.hostSocketId;
-  state.isHost = (socket.id === response.hostSocketId);
+  state.isHost = (socketId === response.hostSocketId);
   state.isLocked = response.isLocked;
+
+  // Set counts for polling comparison
+  lastKnownMessagesCount = response.messages.length;
+  lastKnownFilesCount = response.files.length;
 
   // Header Details
   el.displayRoomCode.innerText = response.roomCode;
@@ -240,151 +584,33 @@ function setupRoom(response, nickname) {
   showView('chat');
   showToast(`Joined Room: ${response.roomCode}`, 'success');
   scrollToBottom();
+
+  // Real-time or polling setup
+  if (pusher) {
+    subscribeToHostEvents(state.roomCode, nickname);
+    subscribeToRoomEvents(state.roomCode, nickname);
+  } else {
+    startPolling(state.roomCode, nickname);
+  }
 }
 
 // --- Action: Send Message ---
-el.chatForm.addEventListener('submit', (e) => {
+el.chatForm.addEventListener('submit', async (e) => {
   e.preventDefault();
   const text = el.messageInput.value.trim();
   if (!text) return;
 
-  socket.emit('send-message', { text });
-  el.messageInput.value = '';
-  el.messageInput.focus();
-});
-
-// --- Socket Event Listeners ---
-socket.on('user-joined', (data) => {
-  state.users = data.users;
-  updateUsersCountUI();
-  renderAllUsers();
-  appendSystemMessage(data.systemMessage.text);
-  showToast(`${data.nickname} joined the room.`, 'info');
-});
-
-socket.on('user-left', (data) => {
-  state.users = data.users;
-  updateUsersCountUI();
-  renderAllUsers();
-  appendSystemMessage(data.systemMessage.text);
-  showToast(`${data.nickname} left the room.`, 'info');
-});
-
-socket.on('message-received', (message) => {
-  appendMessage(message);
-  scrollToBottom();
-});
-
-socket.on('file-shared', (data) => {
-  state.files.push(data.file);
-  renderAllFiles();
-  appendMessage(data.message);
-  scrollToBottom();
-  showToast(`${data.file.sender} uploaded: ${data.file.originalName}`, 'success');
-});
-
-// Real-time Expiration Listeners
-socket.on('message-expired', (data) => {
-  const msgEl = document.getElementById(data.id);
-  if (msgEl) {
-    msgEl.style.transition = 'all 0.5s ease';
-    msgEl.style.opacity = '0';
-    msgEl.style.transform = 'translateY(-10px)';
-    msgEl.style.maxHeight = '0';
-    msgEl.style.padding = '0';
-    msgEl.style.margin = '0';
-    setTimeout(() => msgEl.remove(), 500);
+  try {
+    await fetch('/api/rooms/message', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ roomCode: state.roomCode, sender: state.nickname, text })
+    });
+    el.messageInput.value = '';
+    el.messageInput.focus();
+  } catch (err) {
+    showToast('Failed to send message.', 'error');
   }
-});
-
-socket.on('file-expired', (data) => {
-  state.files = state.files.filter(f => f.id !== data.id);
-  renderAllFiles();
-
-  const attachLink = document.querySelector(`[data-file-id="${data.id}"]`);
-  if (attachLink) {
-    attachLink.style.pointerEvents = 'none';
-    attachLink.style.opacity = '0.4';
-    attachLink.querySelector('.file-card-size').innerText = 'Expired and deleted';
-  }
-  showToast('A shared file has expired and was deleted.', 'info');
-});
-
-// Wait lobby status approvals
-socket.on('join-approved', (data) => {
-  setupRoom(data, state.waitingNickname);
-  state.waitingNickname = null;
-  showToast('Host approved your join request!', 'success');
-});
-
-socket.on('join-declined', (data) => {
-  showView('landing');
-  showToast(data.reason || 'Your join request was declined by the host.', 'error');
-  state.waitingNickname = null;
-});
-
-socket.on('kicked', () => {
-  sessionStorage.setItem('vanishchat_kicked', 'true');
-  window.location.reload();
-});
-
-socket.on('lock-status-changed', (data) => {
-  state.isLocked = data.isLocked;
-  el.lockRoomToggle.checked = data.isLocked;
-});
-
-socket.on('host-transferred', (data) => {
-  state.hostSocketId = data.hostSocketId;
-  state.isHost = (socket.id === data.hostSocketId);
-  
-  if (state.isHost) {
-    el.lockRoomWrapper.classList.remove('hidden');
-    el.lockRoomToggle.checked = state.isLocked;
-    showToast('You are now the room host!', 'success');
-  } else {
-    el.lockRoomWrapper.classList.add('hidden');
-  }
-
-  renderAllUsers();
-  appendSystemMessage(data.systemMessage.text);
-});
-
-// Host lobby requests listeners
-socket.on('lobby-knock', (data) => {
-  if (document.getElementById(`knock-req-${data.socketId}`)) return;
-
-  const card = document.createElement('div');
-  card.className = 'request-card';
-  card.id = `knock-req-${data.socketId}`;
-  card.innerHTML = `
-    <div class="request-info">
-      <strong>${data.nickname}</strong> wants to join the chat
-    </div>
-    <div class="request-actions">
-      <button class="btn-approve btn-approve-accept">Accept</button>
-      <button class="btn-approve btn-approve-decline">Decline</button>
-    </div>
-  `;
-
-  card.querySelector('.btn-approve-accept').addEventListener('click', () => {
-    socket.emit('approve-join', { targetSocketId: data.socketId, approved: true });
-  });
-  card.querySelector('.btn-approve-decline').addEventListener('click', () => {
-    socket.emit('approve-join', { targetSocketId: data.socketId, approved: false });
-  });
-
-  el.lobbyRequestsContainer.appendChild(card);
-  showToast(`Entry request from ${data.nickname}`, 'info');
-});
-
-socket.on('lobby-left', (data) => {
-  const card = document.getElementById(`knock-req-${data.socketId}`);
-  if (card) card.remove();
-});
-
-socket.on('lobby-resolved', (data) => {
-  const card = document.getElementById(`knock-req-${data.socketId}`);
-  if (card) card.remove();
 });
 
 // --- UI Rendering Helpers ---
@@ -449,7 +675,7 @@ function renderAllUsers() {
   el.usersContainer.innerHTML = '';
 
   state.users.forEach(user => {
-    const isUserSelf = user.socketId === socket.id;
+    const isUserSelf = user.socketId === socketId;
     const isUserHost = user.socketId === state.hostSocketId;
 
     const item = document.createElement('div');
@@ -464,7 +690,6 @@ function renderAllUsers() {
     }
 
     let kickBtn = '';
-    // Show kick button if current user is host AND target user is NOT self
     if (state.isHost && !isUserSelf) {
       kickBtn = `
         <button class="btn-kick" title="Kick User" data-socket-id="${user.socketId}">
@@ -483,11 +708,18 @@ function renderAllUsers() {
       ${kickBtn}
     `;
 
-    // Bind kick listener
     if (kickBtn) {
-      item.querySelector('.btn-kick').addEventListener('click', () => {
+      item.querySelector('.btn-kick').addEventListener('click', async () => {
         if (confirm(`Are you sure you want to kick ${user.nickname} from this room?`)) {
-          socket.emit('kick-user', { targetSocketId: user.socketId });
+          try {
+            await fetch('/api/rooms/kick-user', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ roomCode: state.roomCode, socketId, targetSocketId: user.socketId })
+            });
+          } catch (e) {
+            showToast('Failed to kick user.', 'error');
+          }
         }
       });
     }
@@ -559,20 +791,46 @@ el.btnCopyCode.addEventListener('click', () => {
 });
 
 // --- Action: Leave Room ---
-el.btnLeave.addEventListener('click', () => {
+el.btnLeave.addEventListener('click', async () => {
   if (confirm('Are you sure you want to leave the room? All messages and file links will be lost for this session.')) {
+    try {
+      await fetch('/api/rooms/leave', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ roomCode: state.roomCode, socketId, nickname: state.nickname })
+      });
+    } catch (e) {
+      console.error('Error leaving room:', e);
+    }
     window.location.reload();
   }
 });
 
 // --- Action: Cancel Waiting Request ---
-el.btnCancelWaiting.addEventListener('click', () => {
+el.btnCancelWaiting.addEventListener('click', async () => {
+  try {
+    await fetch('/api/rooms/leave', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ roomCode: state.roomCode, socketId, nickname: state.waitingNickname })
+    });
+  } catch (e) {
+    console.error(e);
+  }
   window.location.reload();
 });
 
 // --- Action: Toggle Room Lock ---
-el.lockRoomToggle.addEventListener('change', () => {
-  socket.emit('toggle-lock', { locked: el.lockRoomToggle.checked });
+el.lockRoomToggle.addEventListener('change', async () => {
+  try {
+    await fetch('/api/rooms/toggle-lock', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ roomCode: state.roomCode, socketId, locked: el.lockRoomToggle.checked })
+    });
+  } catch (e) {
+    showToast('Failed to change lock state.', 'error');
+  }
 });
 
 // --- File Upload Infrastructure ---
@@ -611,7 +869,7 @@ feed.addEventListener('drop', (e) => {
   }
 });
 
-function uploadFile(file) {
+async function uploadFile(file) {
   const maxBytes = 50 * 1024 * 1024;
   if (file.size > maxBytes) {
     showToast('File is too large. Capped at 50MB.', 'error');
@@ -619,49 +877,90 @@ function uploadFile(file) {
     return;
   }
 
-  const formData = new FormData();
-  formData.append('file', file);
-  formData.append('roomCode', state.roomCode);
-  formData.append('sender', state.nickname);
-
   el.uploadFilename.innerText = file.name;
   el.uploadPercent.innerText = '0%';
   el.uploadProgressBar.style.width = '0%';
   el.uploadProgressPanel.classList.remove('hidden');
 
-  const xhr = new XMLHttpRequest();
-  xhr.open('POST', '/api/upload', true);
-
-  xhr.upload.onprogress = function (e) {
-    if (e.lengthComputable) {
-      const percentage = Math.round((e.loaded / e.total) * 100);
-      el.uploadPercent.innerText = `${percentage}%`;
-      el.uploadProgressBar.style.width = `${percentage}%`;
-    }
-  };
-
-  xhr.onload = function () {
-    el.uploadProgressPanel.classList.add('hidden');
-    el.fileInput.value = '';
-
-    if (xhr.status === 200) {
-      const res = JSON.parse(xhr.responseText);
-      if (res.success) {
-        showToast('File shared successfully!', 'success');
-      } else {
-        showToast(res.error || 'Failed to upload file.', 'error');
-      }
+  try {
+    let fileUrl = '';
+    if (config.useVercelBlob) {
+      const newBlob = await upload(file.name, file, {
+        access: 'public',
+        handleUploadUrl: '/api/upload-token',
+        onUploadProgress: (progressEvent) => {
+          const percentage = progressEvent.percentage;
+          el.uploadPercent.innerText = `${percentage}%`;
+          el.uploadProgressBar.style.width = `${percentage}%`;
+        }
+      });
+      fileUrl = newBlob.url;
     } else {
-      const res = JSON.parse(xhr.responseText || '{}');
-      showToast(res.error || 'Error uploading file to server.', 'error');
+      fileUrl = await uploadLocalMultipart(file);
     }
-  };
 
-  xhr.onerror = function () {
+    const res = await fetch('/api/rooms/file-shared', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        roomCode: state.roomCode,
+        sender: state.nickname,
+        originalName: file.name,
+        mimeType: file.type,
+        size: file.size,
+        url: fileUrl
+      })
+    });
+    
+    const fileRes = await res.json();
+    if (fileRes.success) {
+      showToast('File shared successfully!', 'success');
+    } else {
+      showToast(fileRes.error || 'Failed to register shared file.', 'error');
+    }
+  } catch (err) {
+    console.error('Upload failed:', err);
+    showToast(err.message || 'Error uploading file.', 'error');
+  } finally {
     el.uploadProgressPanel.classList.add('hidden');
     el.fileInput.value = '';
-    showToast('Network error during file upload.', 'error');
-  };
+  }
+}
 
-  xhr.send(formData);
+function uploadLocalMultipart(file) {
+  return new Promise((resolve, reject) => {
+    const formData = new FormData();
+    formData.append('file', file);
+
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', '/api/upload', true);
+
+    xhr.upload.onprogress = function (e) {
+      if (e.lengthComputable) {
+        const percentage = Math.round((e.loaded / e.total) * 100);
+        el.uploadPercent.innerText = `${percentage}%`;
+        el.uploadProgressBar.style.width = `${percentage}%`;
+      }
+    };
+
+    xhr.onload = function () {
+      if (xhr.status === 200) {
+        const res = JSON.parse(xhr.responseText);
+        if (res.success) {
+          resolve(res.url);
+        } else {
+          reject(new Error(res.error || 'Local upload failed.'));
+        }
+      } else {
+        const res = JSON.parse(xhr.responseText || '{}');
+        reject(new Error(res.error || 'Network error during local upload.'));
+      }
+    };
+
+    xhr.onerror = function () {
+      reject(new Error('Network error during upload.'));
+    };
+
+    xhr.send(formData);
+  });
 }
