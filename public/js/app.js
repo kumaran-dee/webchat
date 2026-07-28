@@ -23,6 +23,14 @@ if (!socketId) {
 const configRes = await fetch('/api/config');
 const config = await configRes.json();
 
+// Check if Redis is configured in production
+const isProduction = window.location.hostname !== 'localhost' && window.location.hostname !== '127.0.0.1';
+if (isProduction && !config.isRedisConfigured) {
+  setTimeout(() => {
+    showToast('Database not connected! Rooms will expire instantly on Vercel. Please connect Upstash Redis in your Vercel Dashboard.', 'error');
+  }, 1000);
+}
+
 // Check if kicked recently (Genius UX check across reload)
 if (sessionStorage.getItem('vanishchat_kicked') === 'true') {
   sessionStorage.removeItem('vanishchat_kicked');

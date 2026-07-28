@@ -180,6 +180,7 @@ app.get('/api/config', (req, res) => {
     useVercelBlob: !!process.env.BLOB_READ_WRITE_TOKEN,
     pusherKey: process.env.PUSHER_KEY || null,
     pusherCluster: process.env.PUSHER_CLUSTER || null,
+    isRedisConfigured: isRedisConfigured
   });
 });
 
