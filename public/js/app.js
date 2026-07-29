@@ -86,6 +86,7 @@ const el = {
   // Message Sending
   chatForm: document.getElementById('chat-form'),
   messageInput: document.getElementById('message-input'),
+  btnSend: document.getElementById('btn-send'),
   fileInput: document.getElementById('file-input'),
   btnAttach: document.getElementById('btn-attach'),
 
@@ -613,9 +614,9 @@ function setupRoom(response, nickname) {
 }
 
 // --- Action: Send Message ---
-el.chatForm.addEventListener('submit', async (e) => {
-  e.preventDefault();
-  const text = el.messageInput.value.trim();
+async function sendMessage() {
+  if (!state.roomCode) return;
+  const text = el.messageInput ? el.messageInput.value.trim() : '';
   if (!text) return;
 
   if (state.isMuted && !state.isHost) {
@@ -624,17 +625,36 @@ el.chatForm.addEventListener('submit', async (e) => {
   }
 
   try {
-    await fetch('/api/rooms/message', {
+    const res = await fetch('/api/rooms/message', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ roomCode: state.roomCode, sender: state.nickname, text, socketId })
     });
-    el.messageInput.value = '';
-    el.messageInput.focus();
+    const result = await res.json();
+    if (result.success) {
+      el.messageInput.value = '';
+      el.messageInput.focus();
+    } else {
+      showToast(result.error || 'Failed to send message.', 'error');
+    }
   } catch (err) {
     showToast('Failed to send message.', 'error');
   }
-});
+}
+
+if (el.chatForm) {
+  el.chatForm.addEventListener('submit', (e) => {
+    e.preventDefault();
+    sendMessage();
+  });
+}
+
+if (el.btnSend) {
+  el.btnSend.addEventListener('click', (e) => {
+    e.preventDefault();
+    sendMessage();
+  });
+}
 
 function updateInputState() {
   if (state.isMuted && !state.isHost) {
@@ -865,115 +885,94 @@ el.btnCancelWaiting.addEventListener('click', async () => {
   window.location.reload();
 });
 
-// --- Action: Toggle Room Lock ---
-el.lockRoomToggle.addEventListener('change', async () => {
-  try {
-    await fetch('/api/rooms/toggle-lock', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ roomCode: state.roomCode, socketId, locked: el.lockRoomToggle.checked })
-    });
-  } catch (e) {
-    showToast('Failed to change lock state.', 'error');
-  }
-});
-
-// --- Action: Toggle Room Mute ---
-el.muteRoomToggle.addEventListener('change', async () => {
-  const desiredMute = el.muteRoomToggle.checked;
-  state.isMuted = desiredMute;
-  updateInputState();
-  try {
-    const res = await fetch('/api/rooms/toggle-mute', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ roomCode: state.roomCode, socketId, muted: desiredMute })
-    });
-    if (!res.ok) {
+// --- Action: Toggle Room Mute (Admin Only Chat) ---
+if (el.muteRoomToggle) {
+  el.muteRoomToggle.addEventListener('change', async () => {
+    const desiredMute = el.muteRoomToggle.checked;
+    state.isMuted = desiredMute;
+    updateInputState();
+    try {
+      const res = await fetch('/api/rooms/toggle-mute', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ roomCode: state.roomCode, socketId, muted: desiredMute })
+      });
+      if (!res.ok) {
+        state.isMuted = !desiredMute;
+        el.muteRoomToggle.checked = !desiredMute;
+        updateInputState();
+        showToast('Failed to change mute state.', 'error');
+      }
+    } catch (e) {
       state.isMuted = !desiredMute;
       el.muteRoomToggle.checked = !desiredMute;
       updateInputState();
       showToast('Failed to change mute state.', 'error');
     }
-  } catch (e) {
-    state.isMuted = !desiredMute;
-    el.muteRoomToggle.checked = !desiredMute;
-    updateInputState();
-    showToast('Failed to change mute state.', 'error');
-  }
-});
+  });
+}
 
 // --- File Upload Infrastructure ---
-el.btnAttach.addEventListener('click', () => {
-  el.fileInput.click();
-});
+if (el.btnAttach && el.fileInput) {
+  el.btnAttach.addEventListener('click', () => {
+    el.fileInput.click();
+  });
 
-el.fileInput.addEventListener('change', () => {
-  if (el.fileInput.files.length > 0) {
-    uploadFile(el.fileInput.files[0]);
-  }
-});
+  el.fileInput.addEventListener('change', () => {
+    if (el.fileInput.files.length > 0) {
+      uploadFile(el.fileInput.files[0]);
+    }
+  });
+}
 
 // Drag and Drop Files inside Messages Feed
-const feed = el.messagesContainer;
+if (el.messagesContainer) {
+  const feed = el.messagesContainer;
 
-['dragenter', 'dragover'].forEach(eventName => {
-  feed.addEventListener(eventName, (e) => {
-    e.preventDefault();
-    feed.style.backgroundColor = 'rgba(99, 102, 241, 0.05)';
-  }, false);
-});
+  ['dragenter', 'dragover'].forEach(eventName => {
+    feed.addEventListener(eventName, (e) => {
+      e.preventDefault();
+      feed.style.backgroundColor = 'rgba(99, 102, 241, 0.05)';
+    }, false);
+  });
 
-['dragleave', 'drop'].forEach(eventName => {
-  feed.addEventListener(eventName, (e) => {
-    e.preventDefault();
-    feed.style.backgroundColor = '';
-  }, false);
-});
+  ['dragleave', 'drop'].forEach(eventName => {
+    feed.addEventListener(eventName, (e) => {
+      e.preventDefault();
+      feed.style.backgroundColor = '';
+    }, false);
+  });
 
-feed.addEventListener('drop', (e) => {
-  const dt = e.dataTransfer;
-  const files = dt.files;
-  if (files.length > 0) {
-    uploadFile(files[0]);
-  }
-});
+  feed.addEventListener('drop', (e) => {
+    const dt = e.dataTransfer;
+    const files = dt.files;
+    if (files.length > 0) {
+      uploadFile(files[0]);
+    }
+  });
+}
 
 async function uploadFile(file) {
   if (state.isMuted && !state.isHost) {
     showToast('Admin Only Chat is enabled. Only the host can share files.', 'error');
-    el.fileInput.value = '';
+    if (el.fileInput) el.fileInput.value = '';
     return;
   }
 
   const maxBytes = 50 * 1024 * 1024;
   if (file.size > maxBytes) {
     showToast('File is too large. Capped at 50MB.', 'error');
-    el.fileInput.value = '';
+    if (el.fileInput) el.fileInput.value = '';
     return;
   }
 
-  el.uploadFilename.innerText = file.name;
-  el.uploadPercent.innerText = '0%';
-  el.uploadProgressBar.style.width = '0%';
-  el.uploadProgressPanel.classList.remove('hidden');
+  if (el.uploadFilename) el.uploadFilename.innerText = file.name;
+  if (el.uploadPercent) el.uploadPercent.innerText = '0%';
+  if (el.uploadProgressBar) el.uploadProgressBar.style.width = '0%';
+  if (el.uploadProgressPanel) el.uploadProgressPanel.classList.remove('hidden');
 
   try {
-    let fileUrl = '';
-    if (config.useVercelBlob) {
-      const newBlob = await upload(file.name, file, {
-        access: 'public',
-        handleUploadUrl: '/api/upload-token',
-        onUploadProgress: (progressEvent) => {
-          const percentage = progressEvent.percentage;
-          el.uploadPercent.innerText = `${percentage}%`;
-          el.uploadProgressBar.style.width = `${percentage}%`;
-        }
-      });
-      fileUrl = newBlob.url;
-    } else {
-      fileUrl = await uploadLocalMultipart(file);
-    }
+    const fileUrl = await uploadLocalMultipart(file);
 
     const res = await fetch('/api/rooms/file-shared', {
       method: 'POST',
