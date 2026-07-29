@@ -236,7 +236,7 @@ app.post('/api/rooms/join', async (req, res) => {
     // Set first joiner as host
     if (!host) {
       host = socketId;
-      await redis.hset(roomKey, 'host', host);
+      await redis.hset(roomKey, { host: host });
     }
 
     // Refresh TTL
@@ -248,7 +248,7 @@ app.post('/api/rooms/join', async (req, res) => {
 
     // Check Lobby / Lock State
     if (isLocked && socketId !== host) {
-      await redis.hset(`${roomKey}:lobby`, socketId, nickname);
+      await redis.hset(`${roomKey}:lobby`, { [socketId]: nickname });
       // Notify host of knock request
       await triggerEvent(`private-host-${host}`, 'lobby-knock', {
         socketId: socketId,
@@ -258,7 +258,7 @@ app.post('/api/rooms/join', async (req, res) => {
     }
 
     // Approve join immediately (unlocked or is host)
-    await redis.hset(`${roomKey}:users`, socketId, nickname);
+    await redis.hset(`${roomKey}:users`, { [socketId]: nickname });
 
     // Get messages & files
     const messagesRaw = await redis.lrange(`${roomKey}:messages`, 0, -1);
@@ -349,7 +349,7 @@ app.post('/api/rooms/toggle-lock', async (req, res) => {
     }
 
     const isLockedStr = locked ? 'true' : 'false';
-    await redis.hset(roomKey, 'isLocked', isLockedStr);
+    await redis.hset(roomKey, { isLocked: isLockedStr });
 
     const systemMessage = {
       id: 'msg-sys-lock-' + Date.now(),
@@ -390,7 +390,7 @@ app.post('/api/rooms/approve-join', async (req, res) => {
     await redis.hdel(`${roomKey}:lobby`, targetSocketId);
 
     if (approved) {
-      await redis.hset(`${roomKey}:users`, targetSocketId, targetNickname);
+      await redis.hset(`${roomKey}:users`, { [targetSocketId]: targetNickname });
 
       const messagesRaw = await redis.lrange(`${roomKey}:messages`, 0, -1);
       const filesRaw = await redis.lrange(`${roomKey}:files`, 0, -1);
@@ -500,7 +500,7 @@ app.post('/api/rooms/heartbeat', async (req, res) => {
     const roomKey = `room:${formattedCode}`;
 
     if (await redis.exists(roomKey)) {
-      await redis.hset(`${roomKey}:users`, socketId, nickname);
+      await redis.hset(`${roomKey}:users`, { [socketId]: nickname });
     }
     res.status(200).json({ success: true });
   } catch (error) {
@@ -537,7 +537,7 @@ app.post('/api/rooms/leave', async (req, res) => {
       if (remainingUsers.length > 0) {
         const nextHostId = remainingUsers[0][0];
         newHostName = remainingUsers[0][1];
-        await redis.hset(roomKey, 'host', nextHostId);
+        await redis.hset(roomKey, { host: nextHostId });
         host = nextHostId;
         hostTransferred = true;
       } else {

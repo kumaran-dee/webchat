@@ -475,11 +475,11 @@ function showToast(message, type = 'info') {
   
   let icon = '';
   if (type === 'success') {
-    icon = `<svg fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M9 12.75L11.25 15 15 9.75M21 12a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>`;
+    icon = `<svg fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M9 12.75L11.25 15 15 9.75M21 12a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>`;
   } else if (type === 'error') {
-    icon = `<svg fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M12 9v3.75m9-.75a9 9 0 11-18 0 9 9 0 0118 0zm-9 3.75h.008v.008H12v-.008z" /></svg>`;
+    icon = `<svg fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M12 9v3.75m9-.75a9 9 0 11-18 0 9 9 0 0118 0zm-9 3.75h.008v.008H12v-.008z" /></svg>`;
   } else {
-    icon = `<svg fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M11.25 11.25l.041-.02a.75.75 0 111.063.852l-.708 2.836a.75.75 0 001.063.852l.041-.021M21 12a9 9 0 11-18 0 9 9 0 0118 0zm-9-3.75h.008v.008H12V8.25z" /></svg>`;
+    icon = `<svg fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M11.25 11.25l.041-.02a.75.75 0 111.063.852l-.708 2.836a.75.75 0 001.063.852l.041-.021M21 12a9 9 0 11-18 0 9 9 0 0118 0zm-9-3.75h.008v.008H12V8.25z" /></svg>`;
   }
 
   toast.innerHTML = `${icon}<span>${message}</span>`;
@@ -522,6 +522,37 @@ el.joinForm.addEventListener('submit', (e) => {
   
   if (!nickname || !roomCode) return;
   joinRoom(roomCode, nickname);
+});
+
+// --- Action: Leave Room ---
+el.btnLeave.addEventListener('click', async () => {
+  if (!state.roomCode) return;
+  try {
+    await fetch('/api/rooms/leave', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ roomCode: state.roomCode, socketId, nickname: state.nickname })
+    });
+  } catch (error) {
+    console.error('Error leaving room:', error);
+  }
+  // Reset state and go to landing
+  state.roomCode = null;
+  state.users = [];
+  state.files = [];
+  state.isHost = false;
+  state.hostSocketId = null;
+  state.isLocked = false;
+  
+  if (pusher) {
+    if (roomChannel) pusher.unsubscribe(roomChannel.name);
+    if (hostChannel) pusher.unsubscribe(hostChannel.name);
+  } else if (pollingInterval) {
+    clearInterval(pollingInterval);
+    pollingInterval = null;
+  }
+  
+  showView('landing');
 });
 
 // --- Join Room Core Logic ---
