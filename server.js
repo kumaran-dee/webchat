@@ -585,57 +585,7 @@ app.post('/api/rooms/leave', async (req, res) => {
   }
 });
 
-// 9. File Upload Metadata Registry (Vercel Blob Callback)
-app.post('/api/rooms/file-shared', async (req, res) => {
-  try {
-    const { roomCode, sender, originalName, mimeType, size, url } = req.body;
-    const formattedCode = roomCode.toUpperCase().trim();
-    const roomKey = `room:${formattedCode}`;
 
-    const exists = await redis.exists(roomKey);
-    if (!exists) {
-      return res.status(400).json({ error: 'Invalid room code.' });
-    }
-
-    const fileId = 'file-' + Date.now() + '-' + Math.round(Math.random() * 1e9);
-    const fileData = {
-      id: fileId,
-      originalName,
-      mimeType,
-      size,
-      path: url, // Serves as the download path
-      sender: sender || 'Anonymous',
-      timestamp: Date.now()
-    };
-
-    await redis.rpush(`${roomKey}:files`, JSON.stringify(fileData));
-
-    const systemMessage = {
-      id: 'msg-file-' + Date.now(),
-      sender: 'System',
-      text: `${sender || 'Someone'} shared a file: ${fileData.originalName}`,
-      timestamp: Date.now(),
-      file: {
-        id: fileData.id,
-        originalName: fileData.originalName,
-        size: fileData.size,
-        mimeType: fileData.mimeType
-      }
-    };
-    await redis.rpush(`${roomKey}:messages`, JSON.stringify(systemMessage));
-
-    // Broadcast file-shared event
-    await triggerEvent(`presence-room-${formattedCode}`, 'file-shared', {
-      file: fileData,
-      message: systemMessage
-    });
-
-    res.status(200).json({ success: true, file: fileData });
-  } catch (error) {
-    console.error('Register shared file error:', error);
-    res.status(500).json({ error: 'Failed to share file.' });
-  }
-});
 
 // 10. File Download Redirect
 app.get('/api/download/:fileId', async (req, res) => {

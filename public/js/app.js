@@ -445,11 +445,12 @@ el.waitingView.classList.add('hidden');
 
 // --- Helper: Format File Size ---
 function formatFileSize(bytes) {
-  if (bytes === 0) return '0 Bytes';
+  const numBytes = Number(bytes);
+  if (isNaN(numBytes) || numBytes <= 0) return '0 Bytes';
   const k = 1024;
   const sizes = ['Bytes', 'KB', 'MB', 'GB'];
-  const i = Math.floor(Math.log(bytes) / Math.log(k));
-  return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+  const i = Math.floor(Math.log(numBytes) / Math.log(k));
+  return parseFloat((numBytes / Math.pow(k, i)).toFixed(2)) + ' ' + (sizes[i] || 'Bytes');
 }
 
 // --- Helper: Select File Icon ---
