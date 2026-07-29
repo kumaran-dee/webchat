@@ -349,9 +349,10 @@ function startPolling(roomCode, nickname) {
       const wasLocked = state.isLocked;
       state.isLocked = data.isLocked;
 
-      // Mute Check
-      if (data.isMuted !== state.isMuted) {
-        state.isMuted = data.isMuted;
+      // Mute Check — guard against undefined (old rooms don't have isMuted field)
+      const serverMuted = data.isMuted === true;
+      if (serverMuted !== state.isMuted) {
+        state.isMuted = serverMuted;
         if (state.isHost) el.muteRoomToggle.checked = state.isMuted;
         updateInputState();
       }
@@ -360,7 +361,10 @@ function startPolling(roomCode, nickname) {
         el.lockRoomWrapper.classList.remove('hidden');
         el.lockRoomToggle.checked = state.isLocked;
         el.muteRoomWrapper.classList.remove('hidden');
-        el.muteRoomToggle.checked = state.isMuted;
+        // Only sync the toggle visually if value truly differs (avoids fighting the user)
+        if (el.muteRoomToggle.checked !== state.isMuted) {
+          el.muteRoomToggle.checked = state.isMuted;
+        }
       } else {
         el.lockRoomWrapper.classList.add('hidden');
         el.muteRoomWrapper.classList.add('hidden');
@@ -1050,15 +1054,19 @@ function uploadLocalMultipart(file) {
 
     xhr.onload = function () {
       if (xhr.status === 200) {
-        const res = JSON.parse(xhr.responseText);
+        let res;
+        try { res = JSON.parse(xhr.responseText); } catch (e) {
+          return reject(new Error('Server returned an unexpected response. Check server logs.'));
+        }
         if (res.success) {
           resolve(res.url);
         } else {
           reject(new Error(res.error || 'Local upload failed.'));
         }
       } else {
-        const res = JSON.parse(xhr.responseText || '{}');
-        reject(new Error(res.error || 'Network error during local upload.'));
+        let res = {};
+        try { res = JSON.parse(xhr.responseText); } catch (e) {}
+        reject(new Error(res.error || `Upload failed with status ${xhr.status}.`));
       }
     };
 

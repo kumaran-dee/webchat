@@ -106,6 +106,17 @@ class MockRedis {
     this.ttls.set(key, Date.now() + seconds * 1000);
   }
 
+  async set(key, value) {
+    this._checkExpired(key);
+    this.store.set(key, value);
+  }
+
+  async get(key) {
+    this._checkExpired(key);
+    const val = this.store.get(key);
+    return (val !== undefined && typeof val !== 'object') ? val : null;
+  }
+
   _checkExpired(key) {
     if (this.ttls.has(key) && Date.now() > this.ttls.get(key)) {
       this.store.delete(key);
@@ -676,8 +687,24 @@ app.get('/api/download/:fileId', async (req, res) => {
     if (fileDataRaw.path.startsWith('http://') || fileDataRaw.path.startsWith('https://')) {
       // Vercel Blob or any remote URL — redirect directly
       res.redirect(fileDataRaw.path);
+    } else if (fileDataRaw.path.startsWith('redis:')) {
+      // Base64 content stored in a separate Redis string key (Vercel fallback)
+      const contentKey = fileDataRaw.path.replace('redis:', '');
+      const dataUrl = await redis.get(contentKey);
+      if (!dataUrl) {
+        return res.status(404).send('File content has expired or was not found.');
+      }
+      const commaIdx = dataUrl.indexOf(',');
+      const header = dataUrl.substring(0, commaIdx);
+      const base64Data = dataUrl.substring(commaIdx + 1);
+      const mimeType = header.replace('data:', '').replace(';base64', '');
+      const buffer = Buffer.from(base64Data, 'base64');
+      res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(fileDataRaw.originalName)}"`);
+      res.setHeader('Content-Type', mimeType || 'application/octet-stream');
+      res.setHeader('Content-Length', buffer.length);
+      res.end(buffer);
     } else if (fileDataRaw.path.startsWith('data:')) {
-      // Base64 data URL stored in Redis (Vercel fallback, files <= 5 MB)
+      // Legacy: base64 data URL stored inline in hset (may exist for older uploads)
       const commaIdx = fileDataRaw.path.indexOf(',');
       const header = fileDataRaw.path.substring(0, commaIdx);
       const base64Data = fileDataRaw.path.substring(commaIdx + 1);
@@ -720,12 +747,24 @@ app.post('/api/rooms/file-shared', async (req, res) => {
     }
 
     const fileId = 'file-' + Date.now() + '-' + Math.round(Math.random() * 1e9);
+
+    // For base64 data URLs (Vercel fallback): store the raw content in a SEPARATE Redis string
+    // key to avoid hset field-value size limits (Upstash free caps individual field values).
+    // For normal URLs we just store the URL string inline — it's tiny.
+    let storedPath = url;
+    if (url.startsWith('data:')) {
+      const contentKey = `filecontent:${fileId}`;
+      await redis.set(contentKey, url);
+      await redis.expire(contentKey, 3600);
+      storedPath = `redis:${contentKey}`; // marker so download knows to look up from Redis string
+    }
+
     const fileData = {
       id: fileId,
       originalName,
       mimeType,
       size: size.toString(),
-      path: url,
+      path: storedPath,
       sender: sender || 'Anonymous',
       timestamp: Date.now().toString()
     };
@@ -733,14 +772,15 @@ app.post('/api/rooms/file-shared', async (req, res) => {
     // Store in room list
     await redis.rpush(`${roomKey}:files`, JSON.stringify(fileData));
     
-    // Store in global fast-lookup index (TTL 1 hour)
+    // Store in global fast-lookup index — hset fields are safe here since path is no longer base64
     await redis.hset(`file:${fileId}`, fileData);
     await redis.expire(`file:${fileId}`, 3600);
 
-    const systemMessage = {
+    // File message shows as a proper chat bubble from the sender, not a bland system strip
+    const fileMessage = {
       id: 'msg-file-' + Date.now(),
-      sender: 'System',
-      text: `${sender || 'Someone'} shared a file: ${fileData.originalName}`,
+      sender: sender || 'Someone',
+      text: '',
       timestamp: Date.now(),
       file: {
         id: fileData.id,
@@ -749,12 +789,12 @@ app.post('/api/rooms/file-shared', async (req, res) => {
         mimeType: fileData.mimeType
       }
     };
-    await redis.rpush(`${roomKey}:messages`, JSON.stringify(systemMessage));
+    await redis.rpush(`${roomKey}:messages`, JSON.stringify(fileMessage));
 
     // Broadcast file-shared event
     await triggerEvent(`presence-room-${formattedCode}`, 'file-shared', {
       file: { ...fileData, size: parseInt(fileData.size), timestamp: parseInt(fileData.timestamp) },
-      message: systemMessage
+      message: fileMessage
     });
 
     res.status(200).json({ success: true, file: fileData });
