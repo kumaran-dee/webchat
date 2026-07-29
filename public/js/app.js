@@ -44,8 +44,8 @@ fetch('/api/config')
   });
 
 // Check if kicked recently
-if (sessionStorage.getItem('vanishchat_kicked') === 'true') {
-  sessionStorage.removeItem('vanishchat_kicked');
+if (sessionStorage.getItem('webchat_kicked') === 'true') {
+  sessionStorage.removeItem('webchat_kicked');
   setTimeout(() => {
     showToast('You were removed from the room by the host.', 'error');
   }, 300);
@@ -162,7 +162,7 @@ function subscribeToHostEvents(roomCode, nickname) {
   hostChannel = pusher.subscribe(channelName);
 
   hostChannel.bind('kicked', () => {
-    sessionStorage.setItem('vanishchat_kicked', 'true');
+    sessionStorage.setItem('webchat_kicked', 'true');
     window.location.reload();
   });
 }
@@ -238,7 +238,7 @@ function startPolling(roomCode, nickname) {
         body: JSON.stringify({ roomCode, socketId, nickname })
       });
       if (res.status === 403) {
-        sessionStorage.setItem('vanishchat_kicked', 'true');
+        sessionStorage.setItem('webchat_kicked', 'true');
         window.location.reload();
       }
     } catch (e) {
@@ -261,7 +261,7 @@ function startPolling(roomCode, nickname) {
       const inUsers = data.users.some(u => u.socketId === socketId);
 
       if (!inUsers && state.roomCode) {
-        sessionStorage.setItem('vanishchat_kicked', 'true');
+        sessionStorage.setItem('webchat_kicked', 'true');
         window.location.reload();
         return;
       }
