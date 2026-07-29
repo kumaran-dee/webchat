@@ -20,22 +20,32 @@ if (!socketId) {
   sessionStorage.setItem('webchat_socket_id', socketId);
 }
 
-// Fetch App configuration dynamically
-const configRes = await fetch('/api/config');
-const config = await configRes.json();
+// Default App Configuration (Updated asynchronously)
+let config = {
+  useVercelBlob: false,
+  pusherKey: null,
+  pusherCluster: null,
+  isRedisConfigured: true
+};
 
-// Check if Redis is configured in production
-const isProduction = window.location.hostname !== 'localhost' && window.location.hostname !== '127.0.0.1';
-if (isProduction && !config.isRedisConfigured) {
-  setTimeout(() => {
-    showToast('Database not connected! Connect Upstash Redis in your Vercel Dashboard for persistent rooms.', 'info');
+// Asynchronously load server configuration without blocking DOM event listener registration
+fetch('/api/config')
+  .then(res => res.json())
+  .then(data => {
+    config = data;
+    initPusher();
     
-    const banner = document.getElementById('db-alert-banner');
-    if (banner) banner.classList.remove('hidden');
-  }, 500);
-}
+    const isProduction = window.location.hostname !== 'localhost' && window.location.hostname !== '127.0.0.1';
+    if (isProduction && !config.isRedisConfigured) {
+      const banner = document.getElementById('db-alert-banner');
+      if (banner) banner.classList.remove('hidden');
+    }
+  })
+  .catch(err => {
+    console.warn('Config fetch warning:', err);
+  });
 
-// Check if kicked recently (Genius UX check across reload)
+// Check if kicked recently
 if (sessionStorage.getItem('vanishchat_kicked') === 'true') {
   sessionStorage.removeItem('vanishchat_kicked');
   setTimeout(() => {
@@ -108,29 +118,31 @@ let pollingInterval = null;
 let lastKnownMessagesCount = 0;
 let lastKnownFilesCount = 0;
 
-if (config.pusherKey) {
-  pusher = new Pusher(config.pusherKey, {
-    cluster: config.pusherCluster,
-    authEndpoint: '/api/pusher/auth'
-  });
+function initPusher() {
+  if (config.pusherKey) {
+    pusher = new Pusher(config.pusherKey, {
+      cluster: config.pusherCluster,
+      authEndpoint: '/api/pusher/auth'
+    });
 
-  pusher.connection.bind('state_change', (states) => {
-    const current = states.current;
-    if (current === 'connected') {
-      el.connectionStatus.innerText = 'Connected';
-      el.statusPulse.style.backgroundColor = 'var(--success)';
-      el.statusPulse.style.boxShadow = '0 0 8px var(--success)';
-    } else {
-      el.connectionStatus.innerText = 'Connecting...';
-      el.statusPulse.style.backgroundColor = 'var(--danger)';
-      el.statusPulse.style.boxShadow = '0 0 8px var(--danger)';
-    }
-  });
-} else {
-  console.warn("Pusher key missing. Real-time functions will use polling.");
-  el.connectionStatus.innerText = 'Connected (Polling)';
-  el.statusPulse.style.backgroundColor = 'var(--success)';
-  el.statusPulse.style.boxShadow = '0 0 8px var(--success)';
+    pusher.connection.bind('state_change', (states) => {
+      const current = states.current;
+      if (current === 'connected') {
+        el.connectionStatus.innerText = 'Connected';
+        el.statusPulse.style.backgroundColor = 'var(--success)';
+        el.statusPulse.style.boxShadow = '0 0 8px var(--success)';
+      } else {
+        el.connectionStatus.innerText = 'Connecting...';
+        el.statusPulse.style.backgroundColor = 'var(--danger)';
+        el.statusPulse.style.boxShadow = '0 0 8px var(--danger)';
+      }
+    });
+  } else {
+    console.warn("Pusher key missing. Real-time functions will use polling.");
+    el.connectionStatus.innerText = 'Connected (Polling)';
+    el.statusPulse.style.backgroundColor = 'var(--success)';
+    el.statusPulse.style.boxShadow = '0 0 8px var(--success)';
+  }
 }
 
 function subscribeToHostEvents(roomCode, nickname) {
