@@ -260,25 +260,7 @@ app.post('/api/rooms/join', async (req, res) => {
       await redis.hset(roomKey, { host: host });
     }
 
-    // Refresh TTL
-    await redis.expire(roomKey, 3600);
-    await redis.expire(`${roomKey}:messages`, 3600);
-    await redis.expire(`${roomKey}:files`, 3600);
-    await redis.expire(`${roomKey}:users`, 3600);
-    await redis.expire(`${roomKey}:lobby`, 3600);
-
-    // Check Lobby / Lock State
-    if (isLocked && socketId !== host) {
-      await redis.hset(`${roomKey}:lobby`, { [socketId]: nickname });
-      // Notify host of knock request
-      await triggerEvent(`private-host-${host}`, 'lobby-knock', {
-        socketId: socketId,
-        nickname: nickname
-      });
-      return res.status(200).json({ success: true, status: 'waiting' });
-    }
-
-    // Approve join immediately (unlocked or is host)
+    // Approve join immediately
     await redis.hset(`${roomKey}:users`, { [socketId]: nickname });
 
     // Get messages & files
@@ -318,7 +300,6 @@ app.post('/api/rooms/join', async (req, res) => {
       files: files,
       users: userList,
       hostSocketId: host,
-      isLocked: isLocked,
       isMuted: room.isMuted === 'true'
     });
   } catch (error) {
@@ -363,41 +344,9 @@ app.post('/api/rooms/message', async (req, res) => {
   }
 });
 
-// 5. Toggle Room Lock
-app.post('/api/rooms/toggle-lock', async (req, res) => {
-  try {
-    const { roomCode, socketId, locked } = req.body;
-    const formattedCode = roomCode.toUpperCase().trim();
-    const roomKey = `room:${formattedCode}`;
 
-    const host = await redis.hget(roomKey, 'host');
-    if (socketId !== host) {
-      return res.status(403).json({ error: 'Only the host can lock the room.' });
-    }
 
-    const isLockedStr = locked ? 'true' : 'false';
-    await redis.hset(roomKey, { isLocked: isLockedStr });
-
-    const systemMessage = {
-      id: 'msg-sys-lock-' + Date.now(),
-      sender: 'System',
-      text: `Room has been ${locked ? 'locked (waiting lobby enabled)' : 'unlocked'}.`,
-      timestamp: Date.now()
-    };
-
-    await redis.rpush(`${roomKey}:messages`, JSON.stringify(systemMessage));
-
-    await triggerEvent(`presence-room-${formattedCode}`, 'lock-status-changed', { isLocked: locked });
-    await triggerEvent(`presence-room-${formattedCode}`, 'message-received', systemMessage);
-
-    res.status(200).json({ success: true, isLocked: locked });
-  } catch (error) {
-    console.error('Toggle lock error:', error);
-    res.status(500).json({ error: 'Failed to toggle lock.' });
-  }
-});
-
-// Toggle Mute
+// 5. Toggle Admin-Only Chat Mute
 app.post('/api/rooms/toggle-mute', async (req, res) => {
   try {
     const { roomCode, socketId, muted } = req.body;
@@ -406,7 +355,7 @@ app.post('/api/rooms/toggle-mute', async (req, res) => {
 
     const host = await redis.hget(roomKey, 'host');
     if (socketId !== host) {
-      return res.status(403).json({ error: 'Only the host can toggle host-only mode.' });
+      return res.status(403).json({ error: 'Only the host can toggle Admin-Only chat.' });
     }
 
     const isMutedStr = muted ? 'true' : 'false';
@@ -415,7 +364,7 @@ app.post('/api/rooms/toggle-mute', async (req, res) => {
     const systemMessage = {
       id: 'msg-sys-mute-' + Date.now(),
       sender: 'System',
-      text: muted ? 'Host only messaging enabled. Only the host can send messages.' : 'Host only messaging disabled. Everyone can send messages.',
+      text: muted ? 'Admin Only Chat enabled. Only the host can send messages and files.' : 'Admin Only Chat disabled. Everyone can send messages and files.',
       timestamp: Date.now()
     };
 
@@ -427,86 +376,9 @@ app.post('/api/rooms/toggle-mute', async (req, res) => {
     res.status(200).json({ success: true, isMuted: muted });
   } catch (error) {
     console.error('Toggle mute error:', error);
-    res.status(500).json({ error: 'Failed to toggle mute.' });
+    res.status(500).json({ error: 'Failed to toggle mute state.' });
   }
 });
-
-// 6. Approve or Decline waiting lobby user
-app.post('/api/rooms/approve-join', async (req, res) => {
-  try {
-    const { roomCode, socketId, targetSocketId, approved } = req.body;
-    const formattedCode = roomCode.toUpperCase().trim();
-    const roomKey = `room:${formattedCode}`;
-
-    const host = await redis.hget(roomKey, 'host');
-    if (socketId !== host) {
-      return res.status(403).json({ error: 'Unauthorized.' });
-    }
-
-    const targetNickname = await redis.hget(`${roomKey}:lobby`, targetSocketId);
-    if (!targetNickname) {
-      return res.status(400).json({ error: 'User is not in the lobby.' });
-    }
-
-    await redis.hdel(`${roomKey}:lobby`, targetSocketId);
-
-    if (approved) {
-      await redis.hset(`${roomKey}:users`, { [targetSocketId]: targetNickname });
-
-      const messagesRaw = await redis.lrange(`${roomKey}:messages`, 0, -1);
-      const filesRaw = await redis.lrange(`${roomKey}:files`, 0, -1);
-
-      const now = Date.now();
-      const messages = messagesRaw.map(m => typeof m === 'string' ? JSON.parse(m) : m)
-                                  .filter(m => now - m.timestamp < EXPIRATION_TIME);
-      const files = filesRaw.map(f => typeof f === 'string' ? JSON.parse(f) : f)
-                            .filter(f => now - f.timestamp < EXPIRATION_TIME);
-
-      const usersMap = await redis.hgetall(`${roomKey}:users`) || {};
-      const userList = Object.entries(usersMap).map(([id, name]) => ({
-        socketId: id,
-        nickname: name
-      }));
-
-      // Notify target client
-      await triggerEvent(`private-host-${targetSocketId}`, 'join-approved', {
-        roomCode: formattedCode,
-        messages: messages,
-        files: files,
-        users: userList,
-        hostSocketId: host,
-        isLocked: true
-      });
-
-      // Broadcast to other users
-      await triggerEvent(`presence-room-${formattedCode}`, 'user-joined', {
-        nickname: targetNickname,
-        socketId: targetSocketId,
-        users: userList,
-        systemMessage: {
-          id: 'msg-sys-' + Date.now(),
-          sender: 'System',
-          text: `${targetNickname} joined the room.`,
-          timestamp: Date.now()
-        }
-      });
-    } else {
-      await triggerEvent(`private-host-${targetSocketId}`, 'join-declined', {
-        reason: 'Your request to join was declined by the host.'
-      });
-    }
-
-    // Resolve lobby status on host UI
-    await triggerEvent(`private-host-${host}`, 'lobby-resolved', { socketId: targetSocketId });
-
-    res.status(200).json({ success: true });
-  } catch (error) {
-    console.error('Approve join error:', error);
-    res.status(500).json({ error: 'Failed to resolve join request.' });
-  }
-});
-
-// 7. Kick User
 app.post('/api/rooms/kick-user', async (req, res) => {
   try {
     const { roomCode, socketId, targetSocketId } = req.body;
@@ -953,20 +825,12 @@ app.get('/api/rooms/:roomCode/updates', async (req, res) => {
       nickname: name
     }));
 
-    const lobbyMap = await redis.hgetall(`${roomKey}:lobby`) || {};
-    const lobbyList = Object.entries(lobbyMap).map(([id, name]) => ({
-      socketId: id,
-      nickname: name
-    }));
-
     res.status(200).json({
       success: true,
       messages,
       files,
       users: userList,
-      lobby: lobbyList,
       host,
-      isLocked,
       isMuted: room.isMuted === 'true'
     });
   } catch (error) {

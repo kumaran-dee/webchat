@@ -54,9 +54,6 @@ const el = {
   // Views
   landingView: document.getElementById('landing-view'),
   chatView: document.getElementById('chat-view'),
-  waitingView: document.getElementById('waiting-view'),
-  waitNickname: document.getElementById('wait-nickname'),
-  btnCancelWaiting: document.getElementById('btn-cancel-waiting'),
   connectionStatus: document.getElementById('connection-status'),
   statusPulse: document.querySelector('.pulse-dot'),
 
@@ -70,8 +67,6 @@ const el = {
   // Chat Area Header
   displayRoomCode: document.getElementById('display-room-code'),
   btnCopyCode: document.getElementById('btn-copy-code'),
-  lockRoomWrapper: document.getElementById('lock-room-wrapper'),
-  lockRoomToggle: document.getElementById('lock-room-toggle'),
   muteRoomWrapper: document.getElementById('mute-room-wrapper'),
   muteRoomToggle: document.getElementById('mute-room-toggle'),
   activeUserCount: document.getElementById('active-user-count'),
@@ -96,9 +91,8 @@ const el = {
   uploadPercent: document.getElementById('upload-percent'),
   uploadProgressBar: document.getElementById('upload-progress-bar'),
 
-  // Toast & Knock requests
-  toastContainer: document.getElementById('toast-container'),
-  lobbyRequestsContainer: document.getElementById('lobby-requests-container')
+  // Toast System
+  toastContainer: document.getElementById('toast-container')
 };
 
 // --- Real-time Subscription (Pusher) & Polling Fallback Setup ---
@@ -137,7 +131,6 @@ if (config.pusherKey) {
 function subscribeToHostEvents(roomCode, nickname) {
   if (!pusher) return;
 
-  // Set Pusher auth payload dynamically
   pusher.config.auth = {
     params: {
       nickname: nickname,
@@ -150,66 +143,9 @@ function subscribeToHostEvents(roomCode, nickname) {
 
   hostChannel = pusher.subscribe(channelName);
 
-  hostChannel.bind('join-approved', (data) => {
-    setupRoom(data, state.waitingNickname || nickname);
-    state.waitingNickname = null;
-    showToast('Host approved your join request!', 'success');
-  });
-
-  hostChannel.bind('join-declined', (data) => {
-    showView('landing');
-    showToast(data.reason || 'Your join request was declined by the host.', 'error');
-    state.waitingNickname = null;
-  });
-
   hostChannel.bind('kicked', () => {
     sessionStorage.setItem('vanishchat_kicked', 'true');
     window.location.reload();
-  });
-
-  hostChannel.bind('lobby-knock', (data) => {
-    if (document.getElementById(`knock-req-${data.socketId}`)) return;
-
-    const card = document.createElement('div');
-    card.className = 'request-card';
-    card.id = `knock-req-${data.socketId}`;
-    card.innerHTML = `
-      <div class="request-info">
-        <strong>${data.nickname}</strong> wants to join the chat
-      </div>
-      <div class="request-actions">
-        <button class="btn-approve btn-approve-accept">Accept</button>
-        <button class="btn-approve btn-approve-decline">Decline</button>
-      </div>
-    `;
-
-    card.querySelector('.btn-approve-accept').addEventListener('click', async () => {
-      await fetch('/api/rooms/approve-join', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ roomCode, socketId, targetSocketId: data.socketId, approved: true })
-      });
-    });
-    card.querySelector('.btn-approve-decline').addEventListener('click', async () => {
-      await fetch('/api/rooms/approve-join', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ roomCode, socketId, targetSocketId: data.socketId, approved: false })
-      });
-    });
-
-    el.lobbyRequestsContainer.appendChild(card);
-    showToast(`Entry request from ${data.nickname}`, 'info');
-  });
-
-  hostChannel.bind('lobby-resolved', (data) => {
-    const card = document.getElementById(`knock-req-${data.socketId}`);
-    if (card) card.remove();
-  });
-
-  hostChannel.bind('lobby-left', (data) => {
-    const card = document.getElementById(`knock-req-${data.socketId}`);
-    if (card) card.remove();
   });
 }
 
@@ -250,12 +186,6 @@ function subscribeToRoomEvents(roomCode, nickname) {
     showToast(`${data.file.sender} uploaded: ${data.file.originalName}`, 'success');
   });
 
-  roomChannel.bind('lock-status-changed', (data) => {
-    state.isLocked = data.isLocked;
-    if (state.isHost) el.lockRoomToggle.checked = state.isLocked;
-    showToast(data.isLocked ? 'Host locked the room' : 'Host unlocked the room', 'info');
-  });
-
   roomChannel.bind('mute-status-changed', (data) => {
     state.isMuted = data.isMuted;
     if (state.isHost) el.muteRoomToggle.checked = state.isMuted;
@@ -267,13 +197,10 @@ function subscribeToRoomEvents(roomCode, nickname) {
     state.isHost = (socketId === data.hostSocketId);
     
     if (state.isHost) {
-      el.lockRoomWrapper.classList.remove('hidden');
-      el.lockRoomToggle.checked = state.isLocked;
       el.muteRoomWrapper.classList.remove('hidden');
       el.muteRoomToggle.checked = state.isMuted;
       showToast('You are now the room host!', 'success');
     } else {
-      el.lockRoomWrapper.classList.add('hidden');
       el.muteRoomWrapper.classList.add('hidden');
     }
 
@@ -314,29 +241,6 @@ function startPolling(roomCode, nickname) {
       if (!data.success) return;
 
       const inUsers = data.users.some(u => u.socketId === socketId);
-      const inLobby = data.lobby.some(u => u.socketId === socketId);
-
-      if (state.waitingNickname) {
-        if (inUsers) {
-          state.waitingNickname = null;
-          setupRoom({
-            roomCode,
-            messages: data.messages,
-            files: data.files,
-            users: data.users,
-            hostSocketId: data.host,
-            isLocked: data.isLocked,
-            isMuted: data.isMuted
-          }, nickname);
-          showToast('Host approved your join request!', 'success');
-        } else if (!inLobby) {
-          state.waitingNickname = null;
-          showView('landing');
-          showToast('Your join request was declined by the host.', 'error');
-          clearInterval(pollingInterval);
-        }
-        return;
-      }
 
       if (!inUsers && state.roomCode) {
         sessionStorage.setItem('vanishchat_kicked', 'true');
@@ -349,11 +253,8 @@ function startPolling(roomCode, nickname) {
       state.files = data.files;
       state.hostSocketId = data.host;
       state.isHost = (socketId === data.host);
-      
-      const wasLocked = state.isLocked;
-      state.isLocked = data.isLocked;
 
-      // Mute Check — guard against undefined (old rooms don't have isMuted field)
+      // Mute Check — guard against undefined
       const serverMuted = data.isMuted === true;
       if (serverMuted !== state.isMuted) {
         state.isMuted = serverMuted;
@@ -362,15 +263,11 @@ function startPolling(roomCode, nickname) {
       }
 
       if (state.isHost) {
-        el.lockRoomWrapper.classList.remove('hidden');
-        el.lockRoomToggle.checked = state.isLocked;
         el.muteRoomWrapper.classList.remove('hidden');
-        // Only sync the toggle visually if value truly differs (avoids fighting the user)
         if (el.muteRoomToggle.checked !== state.isMuted) {
           el.muteRoomToggle.checked = state.isMuted;
         }
       } else {
-        el.lockRoomWrapper.classList.add('hidden');
         el.muteRoomWrapper.classList.add('hidden');
       }
 
@@ -599,20 +496,6 @@ async function joinRoom(roomCode, nickname) {
     const response = await res.json();
 
     if (response.success) {
-      if (response.status === 'waiting') {
-        state.waitingNickname = nickname;
-        el.waitNickname.innerText = nickname;
-        showView('waiting');
-        showToast('Room is locked. Waiting for host approval...', 'info');
-
-        if (pusher) {
-          subscribeToHostEvents(roomCode, nickname);
-        } else {
-          startPolling(roomCode, nickname);
-        }
-        return;
-      }
-      
       setupRoom(response, nickname);
     } else {
       showToast(response.error || 'Failed to join room.', 'error');
@@ -630,7 +513,6 @@ function setupRoom(response, nickname) {
   state.files = response.files;
   state.hostSocketId = response.hostSocketId;
   state.isHost = (socketId === response.hostSocketId);
-  state.isLocked = response.isLocked;
   state.isMuted = response.isMuted;
 
   // Set counts for polling comparison
@@ -643,12 +525,9 @@ function setupRoom(response, nickname) {
 
   // Host panel config
   if (state.isHost) {
-    el.lockRoomWrapper.classList.remove('hidden');
-    el.lockRoomToggle.checked = state.isLocked;
     el.muteRoomWrapper.classList.remove('hidden');
     el.muteRoomToggle.checked = state.isMuted;
   } else {
-    el.lockRoomWrapper.classList.add('hidden');
     el.muteRoomWrapper.classList.add('hidden');
   }
 
@@ -665,7 +544,7 @@ function setupRoom(response, nickname) {
   });
   
   if (response.messages.length === 0) {
-    appendSystemMessage('You joined the ephemeral space. Welcome!');
+    appendSystemMessage('You joined the space. Welcome!');
   }
 
   showView('chat');
@@ -687,6 +566,11 @@ el.chatForm.addEventListener('submit', async (e) => {
   const text = el.messageInput.value.trim();
   if (!text) return;
 
+  if (state.isMuted && !state.isHost) {
+    showToast('Admin Only Chat is enabled. Only the host can send messages.', 'error');
+    return;
+  }
+
   try {
     await fetch('/api/rooms/message', {
       method: 'POST',
@@ -703,7 +587,7 @@ el.chatForm.addEventListener('submit', async (e) => {
 function updateInputState() {
   if (state.isMuted && !state.isHost) {
     el.messageInput.disabled = true;
-    el.messageInput.placeholder = "Host only messaging enabled";
+    el.messageInput.placeholder = "Admin Only Chat enabled";
     el.btnAttach.disabled = true;
   } else {
     el.messageInput.disabled = false;
@@ -809,15 +693,25 @@ function renderAllUsers() {
 
     if (kickBtn) {
       item.querySelector('.btn-kick').addEventListener('click', async () => {
-        if (confirm(`Are you sure you want to kick ${user.nickname} from this room?`)) {
+        if (confirm(`Are you sure you want to remove ${user.nickname} from this room?`)) {
           try {
-            await fetch('/api/rooms/kick-user', {
+            const res = await fetch('/api/rooms/kick-user', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({ roomCode: state.roomCode, socketId, targetSocketId: user.socketId })
             });
+            let result = {};
+            try { result = await res.json(); } catch(e) {}
+            if (res.ok && result.success) {
+              state.users = state.users.filter(u => u.socketId !== user.socketId);
+              updateUsersCountUI();
+              renderAllUsers();
+              showToast(`${user.nickname} was removed.`, 'success');
+            } else {
+              showToast(result.error || 'Failed to remove user.', 'error');
+            }
           } catch (e) {
-            showToast('Failed to kick user.', 'error');
+            showToast('Network error removing user.', 'error');
           }
         }
       });
@@ -994,6 +888,12 @@ feed.addEventListener('drop', (e) => {
 });
 
 async function uploadFile(file) {
+  if (state.isMuted && !state.isHost) {
+    showToast('Admin Only Chat is enabled. Only the host can share files.', 'error');
+    el.fileInput.value = '';
+    return;
+  }
+
   const maxBytes = 50 * 1024 * 1024;
   if (file.size > maxBytes) {
     showToast('File is too large. Capped at 50MB.', 'error');
