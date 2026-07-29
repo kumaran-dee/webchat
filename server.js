@@ -200,6 +200,7 @@ app.post('/api/rooms/create', async (req, res) => {
       code: code,
       createdAt: Date.now().toString(),
       isLocked: 'false',
+      isMuted: 'false',
       host: '' // Will be set when host joins/authenticates
     });
     
@@ -297,7 +298,8 @@ app.post('/api/rooms/join', async (req, res) => {
       files: files,
       users: userList,
       hostSocketId: host,
-      isLocked: isLocked
+      isLocked: isLocked,
+      isMuted: room.isMuted === 'true'
     });
   } catch (error) {
     console.error('Join room error:', error);
@@ -308,13 +310,18 @@ app.post('/api/rooms/join', async (req, res) => {
 // 4. Send Message
 app.post('/api/rooms/message', async (req, res) => {
   try {
-    const { roomCode, sender, text } = req.body;
+    const { roomCode, sender, text, socketId } = req.body;
     const formattedCode = roomCode.toUpperCase().trim();
     const roomKey = `room:${formattedCode}`;
 
     const exists = await redis.exists(roomKey);
     if (!exists) {
       return res.status(400).json({ error: 'Room does not exist or has expired.' });
+    }
+
+    const room = await redis.hgetall(roomKey);
+    if (room.isMuted === 'true' && socketId !== room.host) {
+      return res.status(403).json({ error: 'Host only messaging is enabled.' });
     }
 
     const message = {
@@ -367,6 +374,40 @@ app.post('/api/rooms/toggle-lock', async (req, res) => {
   } catch (error) {
     console.error('Toggle lock error:', error);
     res.status(500).json({ error: 'Failed to toggle lock.' });
+  }
+});
+
+// Toggle Mute
+app.post('/api/rooms/toggle-mute', async (req, res) => {
+  try {
+    const { roomCode, socketId, muted } = req.body;
+    const formattedCode = roomCode.toUpperCase().trim();
+    const roomKey = `room:${formattedCode}`;
+
+    const host = await redis.hget(roomKey, 'host');
+    if (socketId !== host) {
+      return res.status(403).json({ error: 'Only the host can toggle host-only mode.' });
+    }
+
+    const isMutedStr = muted ? 'true' : 'false';
+    await redis.hset(roomKey, { isMuted: isMutedStr });
+
+    const systemMessage = {
+      id: 'msg-sys-mute-' + Date.now(),
+      sender: 'System',
+      text: muted ? 'Host only messaging enabled. Only the host can send messages.' : 'Host only messaging disabled. Everyone can send messages.',
+      timestamp: Date.now()
+    };
+
+    await redis.rpush(`${roomKey}:messages`, JSON.stringify(systemMessage));
+
+    await triggerEvent(`presence-room-${formattedCode}`, 'mute-status-changed', { isMuted: muted });
+    await triggerEvent(`presence-room-${formattedCode}`, 'message-received', systemMessage);
+
+    res.status(200).json({ success: true, isMuted: muted });
+  } catch (error) {
+    console.error('Toggle mute error:', error);
+    res.status(500).json({ error: 'Failed to toggle mute.' });
   }
 });
 
@@ -633,7 +674,7 @@ app.get('/api/download/:fileId', async (req, res) => {
       res.redirect(fileDataRaw.path);
     } else {
       // Local fallback file path
-      const localPath = path.resolve(fileDataRaw.path);
+      const localPath = path.join(__dirname, 'public', fileDataRaw.path);
       if (fs.existsSync(localPath)) {
         res.download(localPath, fileDataRaw.originalName);
       } else {
@@ -649,13 +690,18 @@ app.get('/api/download/:fileId', async (req, res) => {
 // Update `/api/rooms/file-shared` implementation to write the quick lookup index
 app.post('/api/rooms/file-shared', async (req, res) => {
   try {
-    const { roomCode, sender, originalName, mimeType, size, url } = req.body;
+    const { roomCode, sender, originalName, mimeType, size, url, socketId } = req.body;
     const formattedCode = roomCode.toUpperCase().trim();
     const roomKey = `room:${formattedCode}`;
 
     const exists = await redis.exists(roomKey);
     if (!exists) {
       return res.status(400).json({ error: 'Invalid room code.' });
+    }
+
+    const room = await redis.hgetall(roomKey);
+    if (room.isMuted === 'true' && socketId !== room.host) {
+      return res.status(403).json({ error: 'Host only messaging is enabled.' });
     }
 
     const fileId = 'file-' + Date.now() + '-' + Math.round(Math.random() * 1e9);
@@ -836,7 +882,8 @@ app.get('/api/rooms/:roomCode/updates', async (req, res) => {
       users: userList,
       lobby: lobbyList,
       host,
-      isLocked
+      isLocked,
+      isMuted: room.isMuted === 'true'
     });
   } catch (error) {
     res.status(500).json({ error: error.message });

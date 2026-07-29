@@ -9,6 +9,7 @@ let state = {
   isHost: false,
   hostSocketId: null,
   isLocked: false,
+  isMuted: false,
   waitingNickname: null
 };
 
@@ -71,6 +72,8 @@ const el = {
   btnCopyCode: document.getElementById('btn-copy-code'),
   lockRoomWrapper: document.getElementById('lock-room-wrapper'),
   lockRoomToggle: document.getElementById('lock-room-toggle'),
+  muteRoomWrapper: document.getElementById('mute-room-wrapper'),
+  muteRoomToggle: document.getElementById('mute-room-toggle'),
   activeUserCount: document.getElementById('active-user-count'),
   btnLeave: document.getElementById('btn-leave'),
   messagesContainer: document.getElementById('messages-container'),
@@ -249,7 +252,14 @@ function subscribeToRoomEvents(roomCode, nickname) {
 
   roomChannel.bind('lock-status-changed', (data) => {
     state.isLocked = data.isLocked;
-    el.lockRoomToggle.checked = data.isLocked;
+    if (state.isHost) el.lockRoomToggle.checked = state.isLocked;
+    showToast(data.isLocked ? 'Host locked the room' : 'Host unlocked the room', 'info');
+  });
+
+  roomChannel.bind('mute-status-changed', (data) => {
+    state.isMuted = data.isMuted;
+    if (state.isHost) el.muteRoomToggle.checked = state.isMuted;
+    updateInputState();
   });
 
   roomChannel.bind('host-transferred', (data) => {
@@ -259,9 +269,12 @@ function subscribeToRoomEvents(roomCode, nickname) {
     if (state.isHost) {
       el.lockRoomWrapper.classList.remove('hidden');
       el.lockRoomToggle.checked = state.isLocked;
+      el.muteRoomWrapper.classList.remove('hidden');
+      el.muteRoomToggle.checked = state.isMuted;
       showToast('You are now the room host!', 'success');
     } else {
       el.lockRoomWrapper.classList.add('hidden');
+      el.muteRoomWrapper.classList.add('hidden');
     }
 
     renderAllUsers();
@@ -308,7 +321,8 @@ function startPolling(roomCode, nickname) {
             files: data.files,
             users: data.users,
             hostSocketId: data.host,
-            isLocked: data.isLocked
+            isLocked: data.isLocked,
+            isMuted: data.isMuted
           }, nickname);
           showToast('Host approved your join request!', 'success');
         } else if (!inLobby) {
@@ -335,11 +349,21 @@ function startPolling(roomCode, nickname) {
       const wasLocked = state.isLocked;
       state.isLocked = data.isLocked;
 
+      // Mute Check
+      if (data.isMuted !== state.isMuted) {
+        state.isMuted = data.isMuted;
+        if (state.isHost) el.muteRoomToggle.checked = state.isMuted;
+        updateInputState();
+      }
+
       if (state.isHost) {
         el.lockRoomWrapper.classList.remove('hidden');
         el.lockRoomToggle.checked = state.isLocked;
+        el.muteRoomWrapper.classList.remove('hidden');
+        el.muteRoomToggle.checked = state.isMuted;
       } else {
         el.lockRoomWrapper.classList.add('hidden');
+        el.muteRoomWrapper.classList.add('hidden');
       }
 
       if (wasLocked !== state.isLocked) {
@@ -599,6 +623,7 @@ function setupRoom(response, nickname) {
   state.hostSocketId = response.hostSocketId;
   state.isHost = (socketId === response.hostSocketId);
   state.isLocked = response.isLocked;
+  state.isMuted = response.isMuted;
 
   // Set counts for polling comparison
   lastKnownMessagesCount = response.messages.length;
@@ -612,9 +637,14 @@ function setupRoom(response, nickname) {
   if (state.isHost) {
     el.lockRoomWrapper.classList.remove('hidden');
     el.lockRoomToggle.checked = state.isLocked;
+    el.muteRoomWrapper.classList.remove('hidden');
+    el.muteRoomToggle.checked = state.isMuted;
   } else {
     el.lockRoomWrapper.classList.add('hidden');
+    el.muteRoomWrapper.classList.add('hidden');
   }
+
+  updateInputState();
 
   // Draw Sidebar Feeds
   renderAllUsers();
@@ -653,7 +683,7 @@ el.chatForm.addEventListener('submit', async (e) => {
     await fetch('/api/rooms/message', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ roomCode: state.roomCode, sender: state.nickname, text })
+      body: JSON.stringify({ roomCode: state.roomCode, sender: state.nickname, text, socketId })
     });
     el.messageInput.value = '';
     el.messageInput.focus();
@@ -661,6 +691,18 @@ el.chatForm.addEventListener('submit', async (e) => {
     showToast('Failed to send message.', 'error');
   }
 });
+
+function updateInputState() {
+  if (state.isMuted && !state.isHost) {
+    el.messageInput.disabled = true;
+    el.messageInput.placeholder = "Host only messaging enabled";
+    el.btnAttach.disabled = true;
+  } else {
+    el.messageInput.disabled = false;
+    el.messageInput.placeholder = "Type a message...";
+    el.btnAttach.disabled = false;
+  }
+}
 
 // --- UI Rendering Helpers ---
 function updateUsersCountUI() {
@@ -882,6 +924,19 @@ el.lockRoomToggle.addEventListener('change', async () => {
   }
 });
 
+// --- Action: Toggle Room Mute ---
+el.muteRoomToggle.addEventListener('change', async () => {
+  try {
+    await fetch('/api/rooms/toggle-mute', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ roomCode: state.roomCode, socketId, muted: el.muteRoomToggle.checked })
+    });
+  } catch (e) {
+    showToast('Failed to change mute state.', 'error');
+  }
+});
+
 // --- File Upload Infrastructure ---
 el.btnAttach.addEventListener('click', () => {
   el.fileInput.click();
@@ -953,6 +1008,7 @@ async function uploadFile(file) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         roomCode: state.roomCode,
+        socketId: socketId,
         sender: state.nickname,
         originalName: file.name,
         mimeType: file.type,
