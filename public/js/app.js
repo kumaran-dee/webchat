@@ -923,7 +923,9 @@ async function uploadFile(file) {
   if (el.uploadProgressPanel) el.uploadProgressPanel.classList.remove('hidden');
 
   try {
-    const fileUrl = await uploadLocalMultipart(file);
+    const uploadResult = await uploadLocalMultipart(file);
+    const fileUrl = (typeof uploadResult === 'object' && uploadResult.url) ? uploadResult.url : uploadResult;
+    const fileId = (typeof uploadResult === 'object' && uploadResult.fileId) ? uploadResult.fileId : null;
 
     const res = await fetch('/api/rooms/file-shared', {
       method: 'POST',
@@ -935,7 +937,8 @@ async function uploadFile(file) {
         originalName: file.name,
         mimeType: file.type,
         size: file.size,
-        url: fileUrl
+        url: fileUrl,
+        fileId: fileId
       })
     });
     
@@ -993,7 +996,7 @@ function uploadLocalMultipart(file) {
           return reject(new Error('Server returned an unexpected response. Check server logs.'));
         }
         if (res.success) {
-          resolve(res.url);
+          resolve(res);
         } else {
           reject(new Error(res.error || 'Local upload failed.'));
         }

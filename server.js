@@ -637,20 +637,39 @@ app.post('/api/rooms/file-shared', async (req, res) => {
     // For base64 data URLs (Vercel fallback): store the raw content in a SEPARATE Redis string
     // key to avoid hset field-value size limits (Upstash free caps individual field values).
     // For normal URLs we just store the URL string inline — it's tiny.
-    let storedPath = url;
-    if (url.startsWith('data:')) {
+// 10. Register Shared File
+app.post('/api/rooms/file-shared', async (req, res) => {
+  try {
+    const { roomCode, socketId, sender, originalName, mimeType, size, url, fileId: clientFileId } = req.body;
+    const formattedCode = roomCode.toUpperCase().trim();
+    const roomKey = `room:${formattedCode}`;
+
+    const exists = await redis.exists(roomKey);
+    if (!exists) {
+      return res.status(400).json({ error: 'Room does not exist or has expired.' });
+    }
+
+    const room = await redis.hgetall(roomKey);
+    if (room.isMuted === 'true' && socketId !== room.host) {
+      return res.status(403).json({ error: 'Host only file sharing is enabled.' });
+    }
+
+    const fileId = clientFileId || ('file-' + Date.now() + '-' + Math.round(Math.random() * 1e9));
+    const downloadUrl = (url && url.startsWith('/api/download/')) ? url : `/api/download/${fileId}`;
+
+    if (url && url.startsWith('data:')) {
       const contentKey = `filecontent:${fileId}`;
       await redis.set(contentKey, url);
       await redis.expire(contentKey, 3600);
-      storedPath = `redis:${contentKey}`; // marker so download knows to look up from Redis string
     }
 
     const fileData = {
       id: fileId,
-      originalName,
-      mimeType,
-      size: size.toString(),
-      path: storedPath,
+      originalName: originalName || 'file',
+      mimeType: mimeType || 'application/octet-stream',
+      size: (size || 0).toString(),
+      path: downloadUrl,
+      url: downloadUrl,
       sender: sender || 'Anonymous',
       timestamp: Date.now().toString()
     };
@@ -658,11 +677,11 @@ app.post('/api/rooms/file-shared', async (req, res) => {
     // Store in room list
     await redis.rpush(`${roomKey}:files`, JSON.stringify(fileData));
     
-    // Store in global fast-lookup index — hset fields are safe here since path is no longer base64
+    // Store in global fast-lookup index
     await redis.hset(`file:${fileId}`, fileData);
     await redis.expire(`file:${fileId}`, 3600);
 
-    // File message shows as a proper chat bubble from the sender, not a bland system strip
+    // File message shows as a proper chat bubble from the sender
     const fileMessage = {
       id: 'msg-file-' + Date.now(),
       sender: sender || 'Someone',
@@ -672,7 +691,8 @@ app.post('/api/rooms/file-shared', async (req, res) => {
         id: fileData.id,
         originalName: fileData.originalName,
         size: parseInt(fileData.size),
-        mimeType: fileData.mimeType
+        mimeType: fileData.mimeType,
+        url: downloadUrl
       }
     };
     await redis.rpush(`${roomKey}:messages`, JSON.stringify(fileMessage));
@@ -690,7 +710,7 @@ app.post('/api/rooms/file-shared', async (req, res) => {
   }
 });
 
-// 11. Local Upload Endpoint (works on local dev AND Vercel without Blob configured)
+// 11. Upload Endpoint (works on local dev AND Vercel)
 app.post('/api/upload', (req, res) => {
   upload.single('file')(req, res, async (err) => {
     if (err) {
@@ -705,30 +725,71 @@ app.post('/api/upload', (req, res) => {
         return res.status(400).json({ error: 'No file uploaded.' });
       }
 
-      if (isVercel) {
-        // On Vercel without Blob: store file content as base64 data URL.
-        // Redis has a ~1MB per-value soft limit and a hard cap on plan size,
-        // so we reject files over 5 MB here to keep Redis healthy.
-        const MAX_REDIS_BYTES = 50 * 1024 * 1024; // 50 MB
-        if (req.file.size > MAX_REDIS_BYTES) {
-          return res.status(400).json({
-            error: 'File is too large. Capped at 50MB.'
-          });
-        }
-        const mimeType = req.file.mimetype || 'application/octet-stream';
-        const base64 = req.file.buffer.toString('base64');
+      const fileId = 'file-' + Date.now() + '-' + Math.round(Math.random() * 1e9);
+      const mimeType = req.file.mimetype || 'application/octet-stream';
+      const base64 = req.file.buffer ? req.file.buffer.toString('base64') : (req.file.path ? fs.readFileSync(req.file.path).toString('base64') : '');
+
+      if (base64) {
         const dataUrl = `data:${mimeType};base64,${base64}`;
-        return res.status(200).json({ success: true, url: dataUrl });
-      } else {
-        // Local dev: file is on disk, serve via static /uploads/ route
-        const fileUrl = `/uploads/${req.file.filename}`;
-        return res.status(200).json({ success: true, url: fileUrl });
+        const contentKey = `filecontent:${fileId}`;
+        await redis.set(contentKey, dataUrl);
+        await redis.expire(contentKey, 3600);
       }
+
+      const downloadUrl = `/api/download/${fileId}`;
+      return res.status(200).json({ success: true, url: downloadUrl, fileId: fileId });
     } catch (error) {
-      console.error('Local upload API error:', error);
+      console.error('Upload API error:', error);
       res.status(500).json({ error: 'File upload failed.' });
     }
   });
+});
+
+// 12. File Download Endpoint
+app.get('/api/download/:fileId', async (req, res) => {
+  try {
+    const { fileId } = req.params;
+    
+    // Check if content is stored in dedicated Redis string key
+    const contentKey = `filecontent:${fileId}`;
+    let dataUrl = await redis.get(contentKey);
+
+    let originalName = 'download';
+    let mimeType = 'application/octet-stream';
+
+    // Fetch metadata from file hash index if available
+    const fileMeta = await redis.hgetall(`file:${fileId}`);
+    if (fileMeta) {
+      if (fileMeta.originalName) originalName = fileMeta.originalName;
+      if (fileMeta.mimeType) mimeType = fileMeta.mimeType;
+      
+      if (!dataUrl && fileMeta.path) {
+        if (fileMeta.path.startsWith('data:')) {
+          dataUrl = fileMeta.path;
+        } else if (fileMeta.path.startsWith('/uploads/')) {
+          const localPath = path.join(__dirname, 'public', fileMeta.path);
+          return res.download(localPath, originalName);
+        }
+      }
+    }
+
+    if (dataUrl && dataUrl.startsWith('data:')) {
+      const matches = dataUrl.match(/^data:(.+);base64,(.+)$/);
+      if (matches) {
+        const type = matches[1] || mimeType;
+        const buffer = Buffer.from(matches[2], 'base64');
+        res.setHeader('Content-Type', type);
+        res.setHeader('Content-Length', buffer.length);
+        res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(originalName)}"`);
+        return res.send(buffer);
+      }
+    }
+
+    return res.status(404).json({ error: 'File not found or has expired.' });
+  } catch (error) {
+    console.error('Download file error:', error);
+    res.status(500).json({ error: 'Failed to download file.' });
+  }
 });
 
 // 12. Vercel Blob Token Generation
