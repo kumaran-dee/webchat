@@ -683,7 +683,7 @@ app.post('/api/rooms/file-shared', async (req, res) => {
       message: fileMessage
     });
 
-    res.status(200).json({ success: true, file: fileData });
+    res.status(200).json({ success: true, file: fileData, message: fileMessage });
   } catch (error) {
     console.error('Register shared file error:', error);
     res.status(500).json({ error: 'Failed to share file.' });

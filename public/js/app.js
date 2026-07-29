@@ -280,77 +280,28 @@ function startPolling(roomCode, nickname) {
         updateInputState();
       }
 
-      if (state.isHost) {
+      if (state.isHost && el.muteRoomWrapper && el.muteRoomToggle) {
         el.muteRoomWrapper.classList.remove('hidden');
         if (el.muteRoomToggle.checked !== state.isMuted) {
           el.muteRoomToggle.checked = state.isMuted;
         }
-      } else {
+      } else if (el.muteRoomWrapper) {
         el.muteRoomWrapper.classList.add('hidden');
-      }
-
-      if (wasLocked !== state.isLocked) {
-        showToast(`Room has been ${state.isLocked ? 'locked' : 'unlocked'}.`, 'info');
       }
 
       updateUsersCountUI();
       renderAllUsers();
 
-      if (data.messages.length !== lastKnownMessagesCount) {
+      if (data.messages && data.messages.length !== lastKnownMessagesCount) {
         el.messagesContainer.innerHTML = '';
         data.messages.forEach(msg => appendMessage(msg));
         scrollToBottom();
         lastKnownMessagesCount = data.messages.length;
       }
 
-      if (data.files.length !== lastKnownFilesCount) {
+      if (data.files && data.files.length !== lastKnownFilesCount) {
         renderAllFiles();
         lastKnownFilesCount = data.files.length;
-      }
-
-      if (state.isHost) {
-        const existingCards = el.lobbyRequestsContainer.querySelectorAll('.request-card');
-        existingCards.forEach(c => {
-          const id = c.id.replace('knock-req-', '');
-          if (!data.lobby.some(u => u.socketId === id)) {
-            c.remove();
-          }
-        });
-
-        data.lobby.forEach(user => {
-          if (!document.getElementById(`knock-req-${user.socketId}`)) {
-            const card = document.createElement('div');
-            card.className = 'request-card';
-            card.id = `knock-req-${user.socketId}`;
-            card.innerHTML = `
-              <div class="request-info">
-                <strong>${user.nickname}</strong> wants to join the chat
-              </div>
-              <div class="request-actions">
-                <button class="btn-approve btn-approve-accept">Accept</button>
-                <button class="btn-approve btn-approve-decline">Decline</button>
-              </div>
-            `;
-
-            card.querySelector('.btn-approve-accept').addEventListener('click', async () => {
-              await fetch('/api/rooms/approve-join', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ roomCode, socketId, targetSocketId: user.socketId, approved: true })
-              });
-            });
-            card.querySelector('.btn-approve-decline').addEventListener('click', async () => {
-              await fetch('/api/rooms/approve-join', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ roomCode, socketId, targetSocketId: user.socketId, approved: false })
-              });
-            });
-
-            el.lobbyRequestsContainer.appendChild(card);
-            showToast(`Entry request from ${user.nickname}`, 'info');
-          }
-        });
       }
     } catch (e) {
       console.error('Polling error:', e);
@@ -997,6 +948,16 @@ async function uploadFile(file) {
 
     if (fileRes.success) {
       showToast('File shared successfully!', 'success');
+      if (fileRes.file) {
+        state.files.push(fileRes.file);
+        renderAllFiles();
+        lastKnownFilesCount++;
+      }
+      if (fileRes.message) {
+        appendMessage(fileRes.message);
+        scrollToBottom();
+        lastKnownMessagesCount++;
+      }
     } else {
       showToast(fileRes.error || 'Failed to register shared file.', 'error');
     }
