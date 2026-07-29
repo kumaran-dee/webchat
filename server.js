@@ -15,8 +15,8 @@ const __dirname = path.dirname(__filename);
 // Express App Setup
 const app = express();
 app.use(cors());
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ limit: '50mb', extended: true }));
 app.use(express.static(path.join(__dirname, 'public')));
 
 // Ensure Local Uploads Directory exists (for local fallback)
@@ -124,6 +124,7 @@ class MockRedis {
       this.store.delete(`${key}:files`);
       this.store.delete(`${key}:users`);
       this.store.delete(`${key}:lobby`);
+      this.store.delete(`${key}:kicked`);
       this.ttls.delete(key);
     }
   }
@@ -245,6 +246,11 @@ app.post('/api/rooms/join', async (req, res) => {
     }
 
     const room = await redis.hgetall(roomKey);
+    const isKicked = await redis.hget(`${roomKey}:kicked`, socketId);
+    if (isKicked === 'true') {
+      return res.status(403).json({ error: 'You were removed from this room by the host.' });
+    }
+
     const isLocked = room.isLocked === 'true';
     let host = room.host;
 
@@ -518,6 +524,8 @@ app.post('/api/rooms/kick-user', async (req, res) => {
     }
 
     await redis.hdel(`${roomKey}:users`, targetSocketId);
+    await redis.hset(`${roomKey}:kicked`, { [targetSocketId]: 'true' });
+    await redis.expire(`${roomKey}:kicked`, 3600);
 
     const usersMap = await redis.hgetall(`${roomKey}:users`) || {};
     const userList = Object.entries(usersMap).map(([id, name]) => ({
@@ -553,6 +561,12 @@ app.post('/api/rooms/heartbeat', async (req, res) => {
     const { roomCode, socketId, nickname } = req.body;
     const formattedCode = roomCode.toUpperCase().trim();
     const roomKey = `room:${formattedCode}`;
+
+    const isKicked = await redis.hget(`${roomKey}:kicked`, socketId);
+    if (isKicked === 'true') {
+      await redis.hdel(`${roomKey}:users`, socketId);
+      return res.status(403).json({ success: false, kicked: true });
+    }
 
     if (await redis.exists(roomKey)) {
       await redis.hset(`${roomKey}:users`, { [socketId]: nickname });
@@ -823,10 +837,10 @@ app.post('/api/upload', (req, res) => {
         // On Vercel without Blob: store file content as base64 data URL.
         // Redis has a ~1MB per-value soft limit and a hard cap on plan size,
         // so we reject files over 5 MB here to keep Redis healthy.
-        const MAX_REDIS_BYTES = 5 * 1024 * 1024; // 5 MB
+        const MAX_REDIS_BYTES = 50 * 1024 * 1024; // 50 MB
         if (req.file.size > MAX_REDIS_BYTES) {
           return res.status(400).json({
-            error: 'File too large (max 5 MB without Vercel Blob). Please connect Vercel Blob storage in your Vercel Dashboard to upload larger files.'
+            error: 'File is too large. Capped at 50MB.'
           });
         }
         const mimeType = req.file.mimetype || 'application/octet-stream';

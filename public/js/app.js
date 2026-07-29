@@ -287,11 +287,15 @@ function startPolling(roomCode, nickname) {
 
   const sendHeartbeat = async () => {
     try {
-      await fetch('/api/rooms/heartbeat', {
+      const res = await fetch('/api/rooms/heartbeat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ roomCode, socketId, nickname })
       });
+      if (res.status === 403) {
+        sessionStorage.setItem('vanishchat_kicked', 'true');
+        window.location.reload();
+      }
     } catch (e) {
       console.error('Heartbeat error:', e);
     }
@@ -930,13 +934,25 @@ el.lockRoomToggle.addEventListener('change', async () => {
 
 // --- Action: Toggle Room Mute ---
 el.muteRoomToggle.addEventListener('change', async () => {
+  const desiredMute = el.muteRoomToggle.checked;
+  state.isMuted = desiredMute;
+  updateInputState();
   try {
-    await fetch('/api/rooms/toggle-mute', {
+    const res = await fetch('/api/rooms/toggle-mute', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ roomCode: state.roomCode, socketId, muted: el.muteRoomToggle.checked })
+      body: JSON.stringify({ roomCode: state.roomCode, socketId, muted: desiredMute })
     });
+    if (!res.ok) {
+      state.isMuted = !desiredMute;
+      el.muteRoomToggle.checked = !desiredMute;
+      updateInputState();
+      showToast('Failed to change mute state.', 'error');
+    }
   } catch (e) {
+    state.isMuted = !desiredMute;
+    el.muteRoomToggle.checked = !desiredMute;
+    updateInputState();
     showToast('Failed to change mute state.', 'error');
   }
 });
@@ -1021,7 +1037,13 @@ async function uploadFile(file) {
       })
     });
     
-    const fileRes = await res.json();
+    let fileRes;
+    try {
+      fileRes = await res.json();
+    } catch (parseErr) {
+      throw new Error(`Upload server error (${res.status}). Check backend logs.`);
+    }
+
     if (fileRes.success) {
       showToast('File shared successfully!', 'success');
     } else {
