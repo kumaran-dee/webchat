@@ -25,19 +25,22 @@ if (!process.env.VERCEL && !fs.existsSync(UPLOADS_DIR)) {
   fs.mkdirSync(UPLOADS_DIR, { recursive: true });
 }
 
-// Multer Storage Configuration (for local fallback)
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    cb(null, UPLOADS_DIR);
-  },
-  filename: (req, file, cb) => {
-    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1e9);
-    cb(null, uniqueSuffix + path.extname(file.originalname));
-  }
-});
+// Vercel/serverless: must NOT write to filesystem — use memory storage
+// Local dev: can use disk storage for convenience
+const isVercel = !!process.env.VERCEL;
+const storage = isVercel
+  ? multer.memoryStorage()
+  : multer.diskStorage({
+      destination: (req, file, cb) => cb(null, UPLOADS_DIR),
+      filename: (req, file, cb) => {
+        const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1e9);
+        cb(null, uniqueSuffix + path.extname(file.originalname));
+      }
+    });
+
 const upload = multer({
-  storage: storage,
-  limits: { fileSize: 50 * 1024 * 1024 } // 50MB limit
+  storage,
+  limits: { fileSize: 50 * 1024 * 1024 } // 50 MB hard limit
 });
 
 // --- Mock Redis for Local Development ---
@@ -669,11 +672,23 @@ app.get('/api/download/:fileId', async (req, res) => {
       return res.status(404).send('File has expired.');
     }
 
-    // Redirect to Vercel Blob URL or download local file
+    // Serve the file depending on where it was stored
     if (fileDataRaw.path.startsWith('http://') || fileDataRaw.path.startsWith('https://')) {
+      // Vercel Blob or any remote URL — redirect directly
       res.redirect(fileDataRaw.path);
+    } else if (fileDataRaw.path.startsWith('data:')) {
+      // Base64 data URL stored in Redis (Vercel fallback, files <= 5 MB)
+      const commaIdx = fileDataRaw.path.indexOf(',');
+      const header = fileDataRaw.path.substring(0, commaIdx);
+      const base64Data = fileDataRaw.path.substring(commaIdx + 1);
+      const mimeType = header.replace('data:', '').replace(';base64', '');
+      const buffer = Buffer.from(base64Data, 'base64');
+      res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(fileDataRaw.originalName)}"`);
+      res.setHeader('Content-Type', mimeType || 'application/octet-stream');
+      res.setHeader('Content-Length', buffer.length);
+      res.end(buffer);
     } else {
-      // Local fallback file path
+      // Local dev disk file
       const localPath = path.join(__dirname, 'public', fileDataRaw.path);
       if (fs.existsSync(localPath)) {
         res.download(localPath, fileDataRaw.originalName);
@@ -749,7 +764,7 @@ app.post('/api/rooms/file-shared', async (req, res) => {
   }
 });
 
-// 11. Local Upload Endpoint (Fallback for local development)
+// 11. Local Upload Endpoint (works on local dev AND Vercel without Blob configured)
 app.post('/api/upload', (req, res) => {
   upload.single('file')(req, res, async (err) => {
     if (err) {
@@ -764,10 +779,25 @@ app.post('/api/upload', (req, res) => {
         return res.status(400).json({ error: 'No file uploaded.' });
       }
 
-      // Convert local path to a relative URL for download
-      // Since it's stored in public/uploads/ filename
-      const fileUrl = `/uploads/${req.file.filename}`;
-      res.status(200).json({ success: true, url: fileUrl });
+      if (isVercel) {
+        // On Vercel without Blob: store file content as base64 data URL.
+        // Redis has a ~1MB per-value soft limit and a hard cap on plan size,
+        // so we reject files over 5 MB here to keep Redis healthy.
+        const MAX_REDIS_BYTES = 5 * 1024 * 1024; // 5 MB
+        if (req.file.size > MAX_REDIS_BYTES) {
+          return res.status(400).json({
+            error: 'File too large (max 5 MB without Vercel Blob). Please connect Vercel Blob storage in your Vercel Dashboard to upload larger files.'
+          });
+        }
+        const mimeType = req.file.mimetype || 'application/octet-stream';
+        const base64 = req.file.buffer.toString('base64');
+        const dataUrl = `data:${mimeType};base64,${base64}`;
+        return res.status(200).json({ success: true, url: dataUrl });
+      } else {
+        // Local dev: file is on disk, serve via static /uploads/ route
+        const fileUrl = `/uploads/${req.file.filename}`;
+        return res.status(200).json({ success: true, url: fileUrl });
+      }
     } catch (error) {
       console.error('Local upload API error:', error);
       res.status(500).json({ error: 'File upload failed.' });
