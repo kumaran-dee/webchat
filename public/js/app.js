@@ -28,16 +28,10 @@ const config = await configRes.json();
 const isProduction = window.location.hostname !== 'localhost' && window.location.hostname !== '127.0.0.1';
 if (isProduction && !config.isRedisConfigured) {
   setTimeout(() => {
-    showToast('Database not connected! Rooms will expire instantly on Vercel. Please connect Upstash Redis in your Vercel Dashboard.', 'error');
+    showToast('Database not connected! Connect Upstash Redis in your Vercel Dashboard for persistent rooms.', 'info');
     
     const banner = document.getElementById('db-alert-banner');
     if (banner) banner.classList.remove('hidden');
-    
-    // Disable inputs and buttons on landing page
-    const inputs = document.querySelectorAll('#create-form input, #join-form input');
-    const buttons = document.querySelectorAll('#create-form button, #join-form button');
-    inputs.forEach(input => input.disabled = true);
-    buttons.forEach(button => button.disabled = true);
   }, 500);
 }
 
@@ -91,9 +85,20 @@ const el = {
   uploadPercent: document.getElementById('upload-percent'),
   uploadProgressBar: document.getElementById('upload-progress-bar'),
 
+  // Sidebar
+  chatSidebar: document.querySelector('.chat-sidebar'),
+  btnToggleSidebar: document.getElementById('btn-toggle-sidebar'),
+
   // Toast System
   toastContainer: document.getElementById('toast-container')
 };
+
+// Sidebar Toggle Action (Mobile & Tablet)
+if (el.btnToggleSidebar && el.chatSidebar) {
+  el.btnToggleSidebar.addEventListener('click', () => {
+    el.chatSidebar.classList.toggle('active');
+  });
+}
 
 // --- Real-time Subscription (Pusher) & Polling Fallback Setup ---
 let pusher = null;
