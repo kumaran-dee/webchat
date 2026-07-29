@@ -615,28 +615,6 @@ app.get('/api/download/:fileId', async (req, res) => {
   }
 });
 
-// Update `/api/rooms/file-shared` implementation to write the quick lookup index
-app.post('/api/rooms/file-shared', async (req, res) => {
-  try {
-    const { roomCode, sender, originalName, mimeType, size, url, socketId } = req.body;
-    const formattedCode = roomCode.toUpperCase().trim();
-    const roomKey = `room:${formattedCode}`;
-
-    const exists = await redis.exists(roomKey);
-    if (!exists) {
-      return res.status(400).json({ error: 'Invalid room code.' });
-    }
-
-    const room = await redis.hgetall(roomKey);
-    if (room.isMuted === 'true' && socketId !== room.host) {
-      return res.status(403).json({ error: 'Host only messaging is enabled.' });
-    }
-
-    const fileId = 'file-' + Date.now() + '-' + Math.round(Math.random() * 1e9);
-
-    // For base64 data URLs (Vercel fallback): store the raw content in a SEPARATE Redis string
-    // key to avoid hset field-value size limits (Upstash free caps individual field values).
-    // For normal URLs we just store the URL string inline — it's tiny.
 // 10. Register Shared File
 app.post('/api/rooms/file-shared', async (req, res) => {
   try {
