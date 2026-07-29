@@ -1,5 +1,3 @@
-import { upload } from 'https://esm.sh/@vercel/blob/client';
-
 // Application State
 let state = {
   roomCode: null,
@@ -368,7 +366,7 @@ function startPolling(roomCode, nickname) {
 
 // --- View Router ---
 function showView(view) {
-  const panels = [el.landingView, el.chatView, el.waitingView];
+  const panels = [el.landingView, el.chatView];
   panels.forEach(p => {
     if (p) {
       p.classList.remove('active');
@@ -379,7 +377,6 @@ function showView(view) {
   let target = null;
   if (view === 'landing') target = el.landingView;
   else if (view === 'chat') target = el.chatView;
-  else if (view === 'waiting') target = el.waitingView;
 
   if (target) {
     target.classList.remove('hidden');
@@ -388,8 +385,7 @@ function showView(view) {
 }
 
 // Set initial screen states
-el.chatView.classList.add('hidden');
-el.waitingView.classList.add('hidden');
+if (el.chatView) el.chatView.classList.add('hidden');
 
 // --- Helper: Format File Size ---
 function formatFileSize(bytes) {
