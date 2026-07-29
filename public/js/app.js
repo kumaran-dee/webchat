@@ -266,31 +266,31 @@ function startPolling(roomCode, nickname) {
         return;
       }
 
-      // Update local state
-      state.users = data.users;
-      state.files = data.files;
+      state.files = data.files || [];
       state.hostSocketId = data.host;
       state.isHost = (socketId === data.host);
 
-      // Mute Check — guard against undefined
       const serverMuted = data.isMuted === true;
       if (serverMuted !== state.isMuted) {
         state.isMuted = serverMuted;
-        if (state.isHost) el.muteRoomToggle.checked = state.isMuted;
+        if (state.isHost && el.muteRoomToggle) el.muteRoomToggle.checked = state.isMuted;
         updateInputState();
       }
 
       if (state.isHost && el.muteRoomWrapper && el.muteRoomToggle) {
         el.muteRoomWrapper.classList.remove('hidden');
-        if (el.muteRoomToggle.checked !== state.isMuted) {
-          el.muteRoomToggle.checked = state.isMuted;
-        }
       } else if (el.muteRoomWrapper) {
         el.muteRoomWrapper.classList.add('hidden');
       }
 
-      updateUsersCountUI();
-      renderAllUsers();
+      // Update local state users only if changed to prevent DOM flickering
+      const oldUsersJson = JSON.stringify(state.users);
+      const newUsersJson = JSON.stringify(data.users);
+      if (oldUsersJson !== newUsersJson) {
+        state.users = data.users;
+        updateUsersCountUI();
+        renderAllUsers();
+      }
 
       if (data.messages && data.messages.length !== lastKnownMessagesCount) {
         el.messagesContainer.innerHTML = '';
