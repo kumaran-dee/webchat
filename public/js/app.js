@@ -64,9 +64,11 @@ const el = {
   // Forms & Inputs
   createForm: document.getElementById('create-form'),
   createNickname: document.getElementById('create-nickname'),
+  btnCreate: document.getElementById('btn-create'),
   joinForm: document.getElementById('join-form'),
   joinNickname: document.getElementById('join-nickname'),
   joinCode: document.getElementById('join-code'),
+  btnJoin: document.getElementById('btn-join'),
 
   // Chat Area Header
   displayRoomCode: document.getElementById('display-room-code'),
@@ -439,10 +441,12 @@ function showToast(message, type = 'info') {
 }
 
 // --- Action: Create Room ---
-el.createForm.addEventListener('submit', async (e) => {
-  e.preventDefault();
-  const nickname = el.createNickname.value.trim();
-  if (!nickname) return;
+async function handleCreateRoom() {
+  const nickname = el.createNickname ? el.createNickname.value.trim() : '';
+  if (!nickname) {
+    showToast('Please enter your nickname.', 'error');
+    return;
+  }
 
   try {
     const res = await fetch('/api/rooms/create', {
@@ -451,7 +455,7 @@ el.createForm.addEventListener('submit', async (e) => {
       body: JSON.stringify({ nickname })
     });
     const response = await res.json();
-    if (response.success) {
+    if (response.success && response.roomCode) {
       joinRoom(response.roomCode, nickname);
     } else {
       showToast(response.error || 'Failed to create room. Try again.', 'error');
@@ -459,17 +463,52 @@ el.createForm.addEventListener('submit', async (e) => {
   } catch (error) {
     showToast('Network error creating room.', 'error');
   }
-});
+}
+
+if (el.createForm) {
+  el.createForm.addEventListener('submit', (e) => {
+    e.preventDefault();
+    handleCreateRoom();
+  });
+}
+
+if (el.btnCreate) {
+  el.btnCreate.addEventListener('click', (e) => {
+    e.preventDefault();
+    handleCreateRoom();
+  });
+}
 
 // --- Action: Join Room ---
-el.joinForm.addEventListener('submit', (e) => {
-  e.preventDefault();
-  const nickname = el.joinNickname.value.trim();
-  const roomCode = el.joinCode.value.trim().toUpperCase();
+function handleJoinRoom() {
+  const nickname = el.joinNickname ? el.joinNickname.value.trim() : '';
+  const roomCode = el.joinCode ? el.joinCode.value.trim().toUpperCase() : '';
   
-  if (!nickname || !roomCode) return;
+  if (!nickname) {
+    showToast('Please enter your nickname.', 'error');
+    return;
+  }
+  if (!roomCode) {
+    showToast('Please enter a room code.', 'error');
+    return;
+  }
+
   joinRoom(roomCode, nickname);
-});
+}
+
+if (el.joinForm) {
+  el.joinForm.addEventListener('submit', (e) => {
+    e.preventDefault();
+    handleJoinRoom();
+  });
+}
+
+if (el.btnJoin) {
+  el.btnJoin.addEventListener('click', (e) => {
+    e.preventDefault();
+    handleJoinRoom();
+  });
+}
 
 // --- Action: Leave Room ---
 el.btnLeave.addEventListener('click', async () => {

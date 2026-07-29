@@ -60,7 +60,7 @@
           <h2>Create Chat Room</h2>
           <p>Start a secure, temporary space and generate a room code to invite others.</p>
           
-          <form id="create-form" class="card-form" action="javascript:void(0);" onsubmit="return false;">
+          <form id="create-form" class="card-form">
             <div class="input-group">
               <label for="create-nickname">Your Nickname</label>
               <input type="text" id="create-nickname" placeholder="e.g. Alice" maxlength="15" required autocomplete="off">
@@ -84,7 +84,7 @@
           <h2>Join Chat Room</h2>
           <p>Enter an existing room code shared by your peer to enter their chat space.</p>
           
-          <form id="join-form" class="card-form" action="javascript:void(0);" onsubmit="return false;">
+          <form id="join-form" class="card-form">
             <div class="input-group">
               <label for="join-nickname">Your Nickname</label>
               <input type="text" id="join-nickname" placeholder="e.g. Bob" maxlength="15" required autocomplete="off">
@@ -188,7 +188,7 @@
             </div>
 
             <!-- Input Controls -->
-            <form id="chat-form" class="chat-input-area" action="javascript:void(0);" onsubmit="return false;">
+            <form id="chat-form" class="chat-input-area">
               <input type="file" id="file-input" class="hidden-input">
               <button type="button" id="btn-attach" title="Attach file" class="attach-btn">
                 <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor">
