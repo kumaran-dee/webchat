@@ -610,13 +610,19 @@ if (el.btnSend) {
 
 function updateInputState() {
   if (state.isMuted && !state.isHost) {
-    el.messageInput.disabled = true;
-    el.messageInput.placeholder = "Admin Only Chat enabled";
-    el.btnAttach.disabled = true;
+    if (el.messageInput) {
+      el.messageInput.disabled = true;
+      el.messageInput.placeholder = "Admin Only Chat enabled";
+    }
+    if (el.btnAttach) el.btnAttach.disabled = true;
+    if (el.btnSend) el.btnSend.disabled = true;
   } else {
-    el.messageInput.disabled = false;
-    el.messageInput.placeholder = "Type a message...";
-    el.btnAttach.disabled = false;
+    if (el.messageInput) {
+      el.messageInput.disabled = false;
+      el.messageInput.placeholder = "Type a message...";
+    }
+    if (el.btnAttach) el.btnAttach.disabled = false;
+    if (el.btnSend) el.btnSend.disabled = false;
   }
 }
 

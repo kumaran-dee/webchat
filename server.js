@@ -354,26 +354,27 @@ app.post('/api/rooms/toggle-mute', async (req, res) => {
     const roomKey = `room:${formattedCode}`;
 
     const host = await redis.hget(roomKey, 'host');
-    if (socketId !== host) {
+    if ((socketId || '').trim() !== (host || '').trim()) {
       return res.status(403).json({ error: 'Only the host can toggle Admin-Only chat.' });
     }
 
-    const isMutedStr = muted ? 'true' : 'false';
+    const isMutedBool = (muted === true || muted === 'true');
+    const isMutedStr = isMutedBool ? 'true' : 'false';
     await redis.hset(roomKey, { isMuted: isMutedStr });
 
     const systemMessage = {
       id: 'msg-sys-mute-' + Date.now(),
       sender: 'System',
-      text: muted ? 'Admin Only Chat enabled. Only the host can send messages and files.' : 'Admin Only Chat disabled. Everyone can send messages and files.',
+      text: isMutedBool ? 'Admin Only Chat enabled. Only the host can send messages and files.' : 'Admin Only Chat disabled. Everyone can send messages and files.',
       timestamp: Date.now()
     };
 
     await redis.rpush(`${roomKey}:messages`, JSON.stringify(systemMessage));
 
-    await triggerEvent(`presence-room-${formattedCode}`, 'mute-status-changed', { isMuted: muted });
+    await triggerEvent(`presence-room-${formattedCode}`, 'mute-status-changed', { isMuted: isMutedBool });
     await triggerEvent(`presence-room-${formattedCode}`, 'message-received', systemMessage);
 
-    res.status(200).json({ success: true, isMuted: muted });
+    res.status(200).json({ success: true, isMuted: isMutedBool });
   } catch (error) {
     console.error('Toggle mute error:', error);
     res.status(500).json({ error: 'Failed to toggle mute state.' });

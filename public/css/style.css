@@ -802,10 +802,17 @@ body {
   flex-shrink: 0;
 }
 
-.send-btn:hover {
+.send-btn:hover:not(:disabled) {
   background: var(--accent-gradient-hover);
   box-shadow: 0 0 15px rgba(99, 102, 241, 0.35);
   transform: scale(1.02);
+}
+
+.send-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+  pointer-events: none;
+  box-shadow: none;
 }
 
 .send-btn svg {
