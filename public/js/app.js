@@ -401,7 +401,7 @@ async function handleCreateRoom() {
     const res = await fetch('/api/rooms/create', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ nickname })
+      body: JSON.stringify({ nickname, socketId })
     });
     const response = await res.json();
     if (response.success && response.roomCode) {

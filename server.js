@@ -203,7 +203,7 @@ app.get('/api/config', (req, res) => {
 // 2. Create Room
 app.post('/api/rooms/create', async (req, res) => {
   try {
-    const { nickname } = req.body;
+    const { nickname, socketId } = req.body;
     if (!nickname) {
       return res.status(400).json({ error: 'Nickname is required.' });
     }
@@ -216,7 +216,7 @@ app.post('/api/rooms/create', async (req, res) => {
       createdAt: Date.now().toString(),
       isLocked: 'false',
       isMuted: 'false',
-      host: '' // Will be set when host joins/authenticates
+      host: socketId || ''
     });
     
     // Set 1 hour TTL
@@ -254,8 +254,8 @@ app.post('/api/rooms/join', async (req, res) => {
     const isLocked = room.isLocked === 'true';
     let host = room.host;
 
-    // Set first joiner as host
-    if (!host) {
+    // Set joiner as host if room has no host set yet
+    if (!host || host === '') {
       host = socketId;
       await redis.hset(roomKey, { host: host });
     }
@@ -321,8 +321,11 @@ app.post('/api/rooms/message', async (req, res) => {
     }
 
     const room = await redis.hgetall(roomKey);
-    if (room.isMuted === 'true' && socketId !== room.host) {
-      return res.status(403).json({ error: 'Host only messaging is enabled.' });
+    const roomHost = (room.host || '').trim();
+    const senderSocket = (socketId || '').trim();
+
+    if (room.isMuted === 'true' && senderSocket !== roomHost) {
+      return res.status(403).json({ error: 'Admin Only Chat is enabled. Only the host can send messages.' });
     }
 
     const message = {
@@ -353,7 +356,12 @@ app.post('/api/rooms/toggle-mute', async (req, res) => {
     const formattedCode = roomCode.toUpperCase().trim();
     const roomKey = `room:${formattedCode}`;
 
-    const host = await redis.hget(roomKey, 'host');
+    let host = await redis.hget(roomKey, 'host');
+    if (!host || host === '') {
+      host = socketId;
+      await redis.hset(roomKey, { host: host });
+    }
+
     if ((socketId || '').trim() !== (host || '').trim()) {
       return res.status(403).json({ error: 'Only the host can toggle Admin-Only chat.' });
     }
