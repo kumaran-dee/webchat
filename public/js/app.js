@@ -626,10 +626,20 @@ function updateUsersCountUI() {
   el.activeUserCount.innerText = `${count} user${count !== 1 ? 's' : ''} online`;
 }
 
+function escapeHtml(str) {
+  if (!str) return '';
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#039;');
+}
+
 function appendSystemMessage(text) {
   const msgDiv = document.createElement('div');
   msgDiv.className = 'system-message';
-  msgDiv.innerHTML = `<p>${text}</p>`;
+  msgDiv.innerHTML = `<p>${escapeHtml(text)}</p>`;
   el.messagesContainer.appendChild(msgDiv);
 }
 
@@ -642,20 +652,21 @@ function appendMessage(msg) {
   
   if (isSys) {
     msgDiv.className = 'system-message';
-    msgDiv.innerHTML = `<p>${msg.text}</p>`;
+    msgDiv.innerHTML = `<p>${escapeHtml(msg.text)}</p>`;
   } else {
     msgDiv.className = `message-bubble ${isSent ? 'sent' : 'received'}`;
     const formattedTime = new Date(msg.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
     
     let fileAttachmentHtml = '';
     if (msg.file) {
+      const fileName = escapeHtml(msg.file.originalName);
       fileAttachmentHtml = `
         <a href="/api/download/${msg.file.id}" class="message-file-card" data-file-id="${msg.file.id}" target="_blank">
           <div class="file-card-icon">
             ${getFileIconSVG(msg.file.mimeType)}
           </div>
           <div class="file-card-details">
-            <span class="file-card-name" title="${msg.file.originalName}">${msg.file.originalName}</span>
+            <span class="file-card-name" title="${fileName}">${fileName}</span>
             <span class="file-card-size">${formatFileSize(msg.file.size)}</span>
           </div>
           <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" style="width: 16px; height: 16px; margin-left: 8px; color: var(--text-muted);">
@@ -665,10 +676,12 @@ function appendMessage(msg) {
       `;
     }
 
+    const textHtml = msg.text ? `<p>${escapeHtml(msg.text)}</p>` : '';
+
     msgDiv.innerHTML = `
-      <span class="sender">${isSent ? 'You' : msg.sender}</span>
+      <span class="sender">${isSent ? 'You' : escapeHtml(msg.sender)}</span>
       <div class="message-content">
-        <p>${msg.text}</p>
+        ${textHtml}
         ${fileAttachmentHtml}
       </div>
       <span class="message-time">${formattedTime}</span>

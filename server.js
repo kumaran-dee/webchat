@@ -550,18 +550,24 @@ app.post('/api/rooms/file-shared', async (req, res) => {
     const fileId = clientFileId || ('file-' + Date.now() + '-' + Math.round(Math.random() * 1e9));
     const downloadUrl = (url && url.startsWith('/api/download/')) ? url : `/api/download/${fileId}`;
 
+    const existingMeta = (await redis.hgetall(`file:${fileId}`)) || {};
+    let storagePath = existingMeta.path || downloadUrl;
+
     if (url && url.startsWith('data:')) {
       const contentKey = `filecontent:${fileId}`;
       await redis.set(contentKey, url);
       await redis.expire(contentKey, 3600);
+      storagePath = url;
+    } else if (url && (url.startsWith('http://') || url.startsWith('https://') || url.startsWith('/uploads/'))) {
+      storagePath = url;
     }
 
     const fileData = {
       id: fileId,
-      originalName: originalName || 'file',
-      mimeType: mimeType || 'application/octet-stream',
-      size: (size || 0).toString(),
-      path: downloadUrl,
+      originalName: originalName || existingMeta.originalName || 'file',
+      mimeType: mimeType || existingMeta.mimeType || 'application/octet-stream',
+      size: (size || existingMeta.size || 0).toString(),
+      path: storagePath,
       url: downloadUrl,
       sender: sender || 'Anonymous',
       timestamp: Date.now().toString()
