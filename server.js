@@ -528,92 +528,7 @@ app.post('/api/rooms/leave', async (req, res) => {
 
 
 
-// 10. File Download Redirect
-app.get('/api/download/:fileId', async (req, res) => {
-  try {
-    const { fileId } = req.params;
-    
-    // Find file across all active rooms
-    // We can scan keys with Redis, or search the current active room list
-    // In MockRedis/Redis, we list keys with pattern `room:*:files`
-    // Since Upstash Redis doesn't easily support scan without keys count, we can read rooms
-    // An alternative is a global files index, or we look up room codes
-    // For simplicity, search through known active room files in Redis.
-    // However, since Redis is distributed, we can search by keeping a list of files or scanning
-    // Let's do a search on all active room keys
-    // In serverless, since we want this fast, let's keep a global index of files: `files:index` (Hash fileId -> roomCode)
-    // Or we scan. Let's do file lookup by reading from Redis directly.
-    // To make it easy: let's scan all keys starting with `room:`
-    // On Upstash, let's just get the file index or find the roomCode from fileId
-    // Let's add a key `file:${fileId}` when files are created!
-    // That makes lookup O(1) and extremely fast!
-    // Yes! Let's update `file-shared` above to write `await redis.hset("file:" + fileId, fileData)` and set a 1 hour TTL!
-    // That is brilliant!
-    
-    const fileDataRaw = await redis.hgetall(`file:${fileId}`);
-    if (!fileDataRaw) {
-      return res.status(404).send('File not found or has expired.');
-    }
 
-    const now = Date.now();
-    if (now - parseInt(fileDataRaw.timestamp) >= EXPIRATION_TIME) {
-      // Delete from Vercel Blob if URL matches and it's Vercel Blob
-      if (fileDataRaw.path.includes('public.blob.vercel-storage.com')) {
-        try {
-          await del(fileDataRaw.path);
-        } catch (e) {
-          console.error('Failed to delete blob from Vercel storage:', e);
-        }
-      }
-      await redis.del(`file:${fileId}`);
-      return res.status(404).send('File has expired.');
-    }
-
-    // Serve the file depending on where it was stored
-    if (fileDataRaw.path.startsWith('http://') || fileDataRaw.path.startsWith('https://')) {
-      // Vercel Blob or any remote URL — redirect directly
-      res.redirect(fileDataRaw.path);
-    } else if (fileDataRaw.path.startsWith('redis:')) {
-      // Base64 content stored in a separate Redis string key (Vercel fallback)
-      const contentKey = fileDataRaw.path.replace('redis:', '');
-      const dataUrl = await redis.get(contentKey);
-      if (!dataUrl) {
-        return res.status(404).send('File content has expired or was not found.');
-      }
-      const commaIdx = dataUrl.indexOf(',');
-      const header = dataUrl.substring(0, commaIdx);
-      const base64Data = dataUrl.substring(commaIdx + 1);
-      const mimeType = header.replace('data:', '').replace(';base64', '');
-      const buffer = Buffer.from(base64Data, 'base64');
-      res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(fileDataRaw.originalName)}"`);
-      res.setHeader('Content-Type', mimeType || 'application/octet-stream');
-      res.setHeader('Content-Length', buffer.length);
-      res.end(buffer);
-    } else if (fileDataRaw.path.startsWith('data:')) {
-      // Legacy: base64 data URL stored inline in hset (may exist for older uploads)
-      const commaIdx = fileDataRaw.path.indexOf(',');
-      const header = fileDataRaw.path.substring(0, commaIdx);
-      const base64Data = fileDataRaw.path.substring(commaIdx + 1);
-      const mimeType = header.replace('data:', '').replace(';base64', '');
-      const buffer = Buffer.from(base64Data, 'base64');
-      res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(fileDataRaw.originalName)}"`);
-      res.setHeader('Content-Type', mimeType || 'application/octet-stream');
-      res.setHeader('Content-Length', buffer.length);
-      res.end(buffer);
-    } else {
-      // Local dev disk file
-      const localPath = path.join(__dirname, 'public', fileDataRaw.path);
-      if (fs.existsSync(localPath)) {
-        res.download(localPath, fileDataRaw.originalName);
-      } else {
-        res.status(404).send('Local file missing from server.');
-      }
-    }
-  } catch (error) {
-    console.error('Download error:', error);
-    res.status(500).send('Download error occurred.');
-  }
-});
 
 // 10. Register Shared File
 app.post('/api/rooms/file-shared', async (req, res) => {
@@ -704,18 +619,45 @@ app.post('/api/upload', (req, res) => {
       }
 
       const fileId = 'file-' + Date.now() + '-' + Math.round(Math.random() * 1e9);
+      const originalName = req.file.originalname || 'file';
       const mimeType = req.file.mimetype || 'application/octet-stream';
-      const base64 = req.file.buffer ? req.file.buffer.toString('base64') : (req.file.path ? fs.readFileSync(req.file.path).toString('base64') : '');
+      const size = (req.file.size || 0).toString();
+      const downloadUrl = `/api/download/${fileId}`;
 
-      if (base64) {
-        const dataUrl = `data:${mimeType};base64,${base64}`;
-        const contentKey = `filecontent:${fileId}`;
-        await redis.set(contentKey, dataUrl);
-        await redis.expire(contentKey, 3600);
+      // Save initial file metadata in Redis index
+      await redis.hset(`file:${fileId}`, {
+        id: fileId,
+        originalName,
+        mimeType,
+        size,
+        path: downloadUrl,
+        url: downloadUrl,
+        timestamp: Date.now().toString()
+      });
+      await redis.expire(`file:${fileId}`, 3600);
+
+      // Save base64 or disk path
+      if (req.file.filename && !isVercel) {
+        const relPath = '/uploads/' + req.file.filename;
+        await redis.hset(`file:${fileId}`, { path: relPath });
+      } else {
+        const base64 = req.file.buffer ? req.file.buffer.toString('base64') : (req.file.path ? fs.readFileSync(req.file.path).toString('base64') : '');
+        if (base64) {
+          const dataUrl = `data:${mimeType};base64,${base64}`;
+          const contentKey = `filecontent:${fileId}`;
+          await redis.set(contentKey, dataUrl);
+          await redis.expire(contentKey, 3600);
+        }
       }
 
-      const downloadUrl = `/api/download/${fileId}`;
-      return res.status(200).json({ success: true, url: downloadUrl, fileId: fileId });
+      return res.status(200).json({
+        success: true,
+        url: downloadUrl,
+        fileId: fileId,
+        originalName,
+        mimeType,
+        size: parseInt(size)
+      });
     } catch (error) {
       console.error('Upload API error:', error);
       res.status(500).json({ error: 'File upload failed.' });
@@ -728,45 +670,51 @@ app.get('/api/download/:fileId', async (req, res) => {
   try {
     const { fileId } = req.params;
     
-    // Check if content is stored in dedicated Redis string key
-    const contentKey = `filecontent:${fileId}`;
-    let dataUrl = await redis.get(contentKey);
-
-    let originalName = 'download';
-    let mimeType = 'application/octet-stream';
-
     // Fetch metadata from file hash index if available
     const fileMeta = await redis.hgetall(`file:${fileId}`);
-    if (fileMeta) {
-      if (fileMeta.originalName) originalName = fileMeta.originalName;
-      if (fileMeta.mimeType) mimeType = fileMeta.mimeType;
-      
-      if (!dataUrl && fileMeta.path) {
-        if (fileMeta.path.startsWith('data:')) {
-          dataUrl = fileMeta.path;
-        } else if (fileMeta.path.startsWith('/uploads/')) {
-          const localPath = path.join(__dirname, 'public', fileMeta.path);
-          return res.download(localPath, originalName);
-        }
+    let originalName = fileMeta && fileMeta.originalName ? fileMeta.originalName : 'download';
+    let mimeType = fileMeta && fileMeta.mimeType ? fileMeta.mimeType : 'application/octet-stream';
+    let filePath = fileMeta && fileMeta.path ? fileMeta.path : null;
+
+    // 1. Check if saved to local uploads disk directory
+    if (filePath && filePath.startsWith('/uploads/')) {
+      const localPath = path.join(__dirname, 'public', filePath);
+      if (fs.existsSync(localPath)) {
+        return res.download(localPath, originalName);
       }
     }
 
+    // 2. Check if remote URL (e.g. Vercel Blob)
+    if (filePath && (filePath.startsWith('http://') || filePath.startsWith('https://'))) {
+      return res.redirect(filePath);
+    }
+
+    // 3. Check Redis string content
+    const contentKey = `filecontent:${fileId}`;
+    let dataUrl = await redis.get(contentKey);
+    if (!dataUrl && filePath && filePath.startsWith('data:')) {
+      dataUrl = filePath;
+    }
+
     if (dataUrl && dataUrl.startsWith('data:')) {
-      const matches = dataUrl.match(/^data:(.+);base64,(.+)$/);
-      if (matches) {
-        const type = matches[1] || mimeType;
-        const buffer = Buffer.from(matches[2], 'base64');
-        res.setHeader('Content-Type', type);
+      const commaIdx = dataUrl.indexOf(',');
+      if (commaIdx !== -1) {
+        const header = dataUrl.substring(0, commaIdx);
+        const base64Data = dataUrl.substring(commaIdx + 1);
+        const extractedType = header.replace('data:', '').replace(';base64', '');
+        const finalMime = extractedType || mimeType;
+        const buffer = Buffer.from(base64Data, 'base64');
+        res.setHeader('Content-Type', finalMime);
         res.setHeader('Content-Length', buffer.length);
         res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(originalName)}"`);
         return res.send(buffer);
       }
     }
 
-    return res.status(404).json({ error: 'File not found or has expired.' });
+    return res.status(404).send('File not found or has expired.');
   } catch (error) {
     console.error('Download file error:', error);
-    res.status(500).json({ error: 'Failed to download file.' });
+    res.status(500).send('Failed to download file.');
   }
 });
 

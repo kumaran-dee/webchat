@@ -101,7 +101,8 @@ const el = {
   btnToggleSidebar: document.getElementById('btn-toggle-sidebar'),
 
   // Toast System
-  toastContainer: document.getElementById('toast-container')
+  toastContainer: document.getElementById('toast-container'),
+  btnCancelWaiting: document.getElementById('btn-cancel-waiting')
 };
 
 // Sidebar Toggle Action (Mobile & Tablet)
@@ -790,51 +791,57 @@ function scrollToBottom() {
 }
 
 // --- Action: Copy Code ---
-el.btnCopyCode.addEventListener('click', () => {
-  if (!state.roomCode) return;
-  
-  navigator.clipboard.writeText(state.roomCode).then(() => {
-    const tooltip = el.btnCopyCode.querySelector('.tooltip-text');
-    tooltip.innerText = 'Copied!';
-    showToast('Room code copied to clipboard!', 'success');
-    setTimeout(() => {
-      tooltip.innerText = 'Copy';
-    }, 2000);
-  }).catch(err => {
-    console.error('Failed to copy text:', err);
-    showToast('Failed to copy. Double-click the code text.', 'error');
+if (el.btnCopyCode) {
+  el.btnCopyCode.addEventListener('click', () => {
+    if (!state.roomCode) return;
+    
+    navigator.clipboard.writeText(state.roomCode).then(() => {
+      const tooltip = el.btnCopyCode.querySelector('.tooltip-text');
+      if (tooltip) tooltip.innerText = 'Copied!';
+      showToast('Room code copied to clipboard!', 'success');
+      setTimeout(() => {
+        if (tooltip) tooltip.innerText = 'Copy';
+      }, 2000);
+    }).catch(err => {
+      console.error('Failed to copy text:', err);
+      showToast('Failed to copy. Double-click the code text.', 'error');
+    });
   });
-});
+}
 
 // --- Action: Leave Room ---
-el.btnLeave.addEventListener('click', async () => {
-  if (confirm('Are you sure you want to leave the room? All messages and file links will be lost for this session.')) {
+if (el.btnLeave) {
+  el.btnLeave.addEventListener('click', async () => {
+    if (confirm('Are you sure you want to leave the room? All messages and file links will be lost for this session.')) {
+      try {
+        await fetch('/api/rooms/leave', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ roomCode: state.roomCode, socketId, nickname: state.nickname })
+        });
+      } catch (e) {
+        console.error('Error leaving room:', e);
+      }
+      window.location.reload();
+    }
+  });
+}
+
+// --- Action: Cancel Waiting Request ---
+if (el.btnCancelWaiting) {
+  el.btnCancelWaiting.addEventListener('click', async () => {
     try {
       await fetch('/api/rooms/leave', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ roomCode: state.roomCode, socketId, nickname: state.nickname })
+        body: JSON.stringify({ roomCode: state.roomCode, socketId, nickname: state.waitingNickname })
       });
     } catch (e) {
-      console.error('Error leaving room:', e);
+      console.error(e);
     }
     window.location.reload();
-  }
-});
-
-// --- Action: Cancel Waiting Request ---
-el.btnCancelWaiting.addEventListener('click', async () => {
-  try {
-    await fetch('/api/rooms/leave', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ roomCode: state.roomCode, socketId, nickname: state.waitingNickname })
-    });
-  } catch (e) {
-    console.error(e);
-  }
-  window.location.reload();
-});
+  });
+}
 
 // --- Action: Toggle Room Mute (Admin Only Chat) ---
 if (el.muteRoomToggle) {
@@ -865,12 +872,25 @@ if (el.muteRoomToggle) {
 
 // --- File Upload Infrastructure ---
 if (el.btnAttach && el.fileInput) {
-  el.btnAttach.addEventListener('click', () => {
+  el.btnAttach.addEventListener('click', (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+
+    if (!state.roomCode) {
+      showToast('You must be in a chat room to upload files.', 'error');
+      return;
+    }
+
+    if (state.isMuted && !state.isHost) {
+      showToast('Admin Only Chat is enabled. Only the host can share files.', 'error');
+      return;
+    }
+
     el.fileInput.click();
   });
 
   el.fileInput.addEventListener('change', () => {
-    if (el.fileInput.files.length > 0) {
+    if (el.fileInput.files && el.fileInput.files.length > 0) {
       uploadFile(el.fileInput.files[0]);
     }
   });

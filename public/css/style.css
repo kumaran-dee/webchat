@@ -724,7 +724,10 @@ body {
 }
 
 .hidden-input {
-  display: none;
+  display: none !important;
+  visibility: hidden;
+  position: absolute;
+  left: -9999px;
 }
 
 .attach-btn {
@@ -742,10 +745,16 @@ body {
   flex-shrink: 0;
 }
 
-.attach-btn:hover {
+.attach-btn:hover:not(:disabled) {
   color: #fff;
   border-color: var(--border-focus);
   background: rgba(255, 255, 255, 0.07);
+}
+
+.attach-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+  pointer-events: none;
 }
 
 .attach-btn svg {
